@@ -1,5 +1,6 @@
 # CreatorDashboard
 Open Source Creator Dashboard for Gavinnn's Account Creator
+Required: https://github.com/gavinnn101/jagex_account_creator
 
 Can be ran on Windows by placing both index.php and dashboard.php inside your wamp's www directory.
 WampServer, or another way to serve php files, is required on Windows.
