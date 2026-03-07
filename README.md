@@ -10,3 +10,5 @@ Your EF API Key is necessary for the dashboard to function.
 You can add/remove categories to track and monitor easily.
 
 Posting this AI slop to prevent rats from selling Gavinnn's open-source project with a fancy cover on it.
+<img width="2519" height="1260" alt="image" src="https://github.com/user-attachments/assets/014aaf04-8da2-4efd-8e2d-320fc5cd9b03" />
+<img width="2538" height="910" alt="image" src="https://github.com/user-attachments/assets/b7cfb178-786c-49b4-9ce7-4b1e60167115" />
