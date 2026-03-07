@@ -1,4 +1,5 @@
 <?php
+ini_set('memory_limit', '32M'); // streaming reads keep actual usage under 4MB
 // ── AJAX endpoints — must be first, before any HTML output ───────────────────
 $guiCfgPath  = __DIR__ . '/gui_config.json';
 $pidFilePath = __DIR__ . '/creator.pid';
@@ -27,24 +28,22 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail'])) {
 
     if (isset($_GET['log_tail'])) {
         header('Content-Type: application/json');
-        $lines = ($lf && file_exists($lf))
-            ? array_slice(file($lf, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES), -120)
-            : [];
-
-        // Parse bandwidth stats from log
-        $created = 0; $failed = 0; $totalMb = 0.0;
-        $allLines = ($lf && file_exists($lf))
-            ? file($lf, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES)
-            : [];
-        foreach ($allLines as $line) {
-            // Matches: | SUCCESS | ... Total data used: 0.82MB.
-            if (stripos($line, 'SUCCESS') !== false && preg_match('/Total data used: ([\d.]+)MB/i', $line, $m)) {
-                $totalMb += (float)$m[1]; $created++;
+        // Stream line-by-line — no full file load into RAM
+        $lines = []; $created = 0; $failed = 0; $totalMb = 0.0;
+        if ($lf && file_exists($lf) && ($fh = @fopen($lf, 'r')) !== false) {
+            while (($ln = fgets($fh)) !== false) {
+                $ln = rtrim($ln);
+                if ($ln === '') continue;
+                $lines[] = $ln;
+                if (count($lines) > 120) array_shift($lines);
+                if (stripos($ln, 'SUCCESS') !== false && preg_match('/Total data used: ([\d.]+)MB/i', $ln, $m)) {
+                    $totalMb += (float)$m[1]; $created++;
+                }
+                if (preg_match('/Failed creations:\s*([1-9]\d*)/i', $ln, $m)) {
+                    $failed += (int)$m[1];
+                }
             }
-            // Matches: | INFO | ... Failed creations: N  (where N > 0)
-            if (preg_match('/Failed creations:\s*([1-9]\d*)/i', $line, $m)) {
-                $failed += (int)$m[1];
-            }
+            fclose($fh);
         }
         $avgMb = $created > 0 ? round($totalMb / $created, 2) : 0;
 
@@ -262,8 +261,9 @@ function isRunning(string $pidFile): bool {
 function parseBandwidth(string $logFile): array {
     $stats = ['total_mb' => 0.0, 'runs' => [], 'created' => 0, 'failed' => 0];
     if (!file_exists($logFile)) return $stats;
-    $lines = file($logFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    foreach ($lines as $line) {
+    $fh = @fopen($logFile, 'r');
+    if (!$fh) return $stats;
+    while (($line = fgets($fh)) !== false) {
         if (stripos($line, 'SUCCESS') !== false && preg_match('/Total data used: ([\d.]+)MB/i', $line, $m)) {
             $stats['total_mb'] += (float)$m[1];
             $stats['runs'][] = ['mb' => (float)$m[1]];
@@ -273,6 +273,7 @@ function parseBandwidth(string $logFile): array {
             $stats['failed'] += (int)$m[1];
         }
     }
+    fclose($fh);
     return $stats;
 }
 
@@ -470,9 +471,14 @@ $proxyJson     = json_encode($proxyList);
 
 // Log tail (last 120 lines)
 $logLines = [];
-if (file_exists($logFile)) {
-    $all = file($logFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    $logLines = array_slice($all, -120);
+if (file_exists($logFile) && ($fh = @fopen($logFile, 'r')) !== false) {
+    while (($line = fgets($fh)) !== false) {
+        $line = rtrim($line);
+        if ($line === '') continue;
+        $logLines[] = $line;
+        if (count($logLines) > 120) array_shift($logLines);
+    }
+    fclose($fh);
 }
 ?>
 <!DOCTYPE html>
@@ -615,6 +621,7 @@ textarea{resize:vertical;min-height:80px}
   </div>
   <a class="nav-link active" href="index.php">Creator GUI</a>
   <a class="nav-link" href="dashboard.php">Account Dashboard</a>
+  <a class="nav-link" href="agents.php">Agent Monitor</a>
   <div class="nav-right">
     <div class="status-dot <?= $running ? 'running' : '' ?>"></div>
     <span class="status-label"><?= $running ? 'RUNNING' : 'STOPPED' ?></span>

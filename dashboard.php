@@ -254,6 +254,7 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
   </div>
   <a class="nav-link" href="index.php">Creator GUI</a>
   <a class="nav-link active" href="dashboard.php">Account Dashboard</a>
+  <a class="nav-link" href="agents.php">Agent Monitor</a>
   <div class="nav-right">
     <div class="clock" id="clockEl"></div>
     <span class="refresh-label" id="refEl"></span>
