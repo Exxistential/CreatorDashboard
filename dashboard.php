@@ -14,6 +14,21 @@ function saveGui(string $p, array $d): void {
     file_put_contents($p, json_encode($d, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 }
 
+// ── Snapshot helpers for GP/hr and survival rate tracking ────────────────────
+function loadSnapshots(string $guiConfig): array {
+    $f = dirname($guiConfig) . '/dashboard_snapshots.json';
+    if (!file_exists($f)) return [];
+    return json_decode(file_get_contents($f), true) ?? [];
+}
+function saveSnapshots(string $guiConfig, array $snaps): void {
+    $f = dirname($guiConfig) . '/dashboard_snapshots.json';
+    // Keep last 60 snapshots per category (~1hr at 60s refresh)
+    foreach ($snaps as $id => $entries) {
+        if (count($entries) > 60) $snaps[$id] = array_slice($entries, -60);
+    }
+    file_put_contents($f, json_encode($snaps));
+}
+
 function efget(string $ep, array $params, string $key): ?array {
     if (!$key) return null;
     $url = 'https://api.eternalfarm.net/v1/' . ltrim($ep, '/') . '?' .
@@ -143,6 +158,79 @@ foreach ($monitored as $cat) {
     $grandActive += $d['active'];
     $grandGP     += $d['gp'];
 }
+
+// Snapshot + trend tracking
+$snaps = loadSnapshots($guiConfig);
+$now   = time();
+
+foreach ($cards as &$card) {
+    $id  = $card['id'];
+    $pct = $card['total'] > 0 ? round(($card['active']/$card['total'])*100,1) : 0;
+
+    // Add snapshot if enough time has passed since last one
+    $last = !empty($snaps[$id]) ? end($snaps[$id]) : null;
+    if (!$last || ($now - $last['ts']) >= ($refreshSec - 2)) {
+        $snaps[$id][] = ['ts' => $now, 'gp' => $card['gp'], 'pct' => $pct];
+    }
+
+    // ── GP/hr via linear regression over a 30-min rolling window ──────────────
+    // Instead of just comparing the last two points (noisy), we fit a line
+    // through all points in the last 30 minutes. The slope of that line
+    // (GP per second) is then multiplied by 3600 for GP/hr.
+    // This smooths out the estimate as more data accumulates.
+    $card['gp_hr']       = 0;
+    $card['gp_hr_stable']= false; // true once we have ≥5 min of data
+    $card['gp_hr_age']   = 0;    // minutes of data we're averaging over
+
+    if (!empty($snaps[$id]) && count($snaps[$id]) >= 2) {
+        // Pull all points from the last 30 minutes
+        $window = array_values(array_filter($snaps[$id], fn($s) => ($now - $s['ts']) <= 1800));
+        if (count($window) < 2) $window = array_slice($snaps[$id], -2);
+
+        $n = count($window);
+        // Linear regression: y = gp, x = timestamp (seconds)
+        $sumX = $sumY = $sumXY = $sumX2 = 0;
+        foreach ($window as $pt) {
+            $sumX  += $pt['ts'];
+            $sumY  += $pt['gp'];
+            $sumXY += $pt['ts'] * $pt['gp'];
+            $sumX2 += $pt['ts'] * $pt['ts'];
+        }
+        $denom = ($n * $sumX2 - $sumX * $sumX);
+        if ($denom != 0) {
+            $slope = ($n * $sumXY - $sumX * $sumY) / $denom; // GP per second
+            $card['gp_hr'] = (int)round($slope * 3600);
+        }
+
+        $spanMin = round(($window[$n-1]['ts'] - $window[0]['ts']) / 60, 1);
+        $card['gp_hr_age']    = $spanMin;
+        $card['gp_hr_stable'] = $spanMin >= 5;
+    }
+
+    // ── Survival drop alert: dropped ≥5% vs 10 min ago (not just last tick) ──
+    $card['survival_drop'] = false;
+    if (!empty($snaps[$id]) && count($snaps[$id]) >= 2) {
+        // Find a snapshot from ~10 minutes ago
+        $ref = null;
+        foreach ($snaps[$id] as $s) {
+            if (($now - $s['ts']) <= 600) { $ref = $s; break; }
+        }
+        if (!$ref) $ref = $snaps[$id][0]; // oldest available
+        $curr = end($snaps[$id])['pct'];
+        if (($ref['pct'] - $curr) >= 5) $card['survival_drop'] = true;
+    }
+    $card['survival_pct'] = $pct;
+}
+unset($card);
+saveSnapshots($guiConfig, $snaps);
+
+// Build alerts
+$dashAlerts = [];
+foreach ($cards as $card) {
+    if ($card['survival_drop']) {
+        $dashAlerts[] = '⚠ <strong>'.htmlspecialchars($card['name']).'</strong> survival rate dropped — possible ban wave.';
+    }
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -255,6 +343,7 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
   <a class="nav-link" href="index.php">Creator GUI</a>
   <a class="nav-link active" href="dashboard.php">Account Dashboard</a>
   <a class="nav-link" href="agents.php">Agent Monitor</a>
+  <a class="nav-link" href="accounts.php">Accounts</a>
   <div class="nav-right">
     <div class="clock" id="clockEl"></div>
     <span class="refresh-label" id="refEl"></span>
@@ -297,6 +386,15 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
       </form>
     </div>
   </div>
+
+  <!-- Alerts -->
+  <?php if (!empty($dashAlerts)): ?>
+  <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
+    <?php foreach ($dashAlerts as $al): ?>
+      <div style="padding:9px 14px;border-radius:6px;font-family:var(--mono);font-size:11px;background:rgba(255,59,92,.07);color:var(--danger);border:1px solid rgba(255,59,92,.2)"><?= $al ?></div>
+    <?php endforeach; ?>
+  </div>
+  <?php endif; ?>
 
   <!-- Grand totals -->
   <?php if (!empty($cards)): ?>
@@ -358,9 +456,40 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
           <div class="sl">GP Total</div>
           <div class="sv c-g"><?= fmtGold($c['gp']) ?></div>
         </div>
-        <div class="sc sp2">
+        <div class="sc">
           <div class="sl">GP / Active Acct</div>
           <div class="sv c-p"><?= $gpPerAcc > 0 ? fmtGold($gpPerAcc) : '—' ?></div>
+        </div>
+        <div class="sc" style="grid-column:span 3">
+          <?php
+            $gphr    = (int)($c['gp_hr'] ?? 0);
+            $stable  = !empty($c['gp_hr_stable']);
+            $age     = (float)($c['gp_hr_age'] ?? 0);
+            $hrColor = $gphr < 0 ? 'var(--danger)' : ($gphr > 0 ? 'var(--warn)' : 'var(--muted)');
+            $conf    = $stable ? 'HIGH' : ($age >= 2 ? 'MED' : 'LOW');
+            $confCol = $stable ? 'var(--accent)' : ($age >= 2 ? 'var(--warn)' : 'var(--muted)');
+            $ageStr  = $age >= 1 ? round($age).'m window' : ($age > 0 ? round($age*60).'s window' : 'collecting…');
+          ?>
+          <div style="display:flex;align-items:center;justify-content:space-between">
+            <div class="sl">GP / Hour <span style="color:<?= $confCol ?>;font-size:8px;margin-left:4px"><?= $conf ?> CONF</span></div>
+            <div style="font-family:var(--mono);font-size:9px;color:var(--muted)"><?= $ageStr ?></div>
+          </div>
+          <div style="display:flex;align-items:baseline;gap:10px;margin-top:4px">
+            <div class="sv" style="font-size:20px;color:<?= $hrColor ?>">
+              <?= $gphr !== 0 ? ($gphr > 0 ? '+' : '') . fmtGold($gphr) : '—' ?>
+            </div>
+            <?php if ($gphr !== 0 && $c['active'] > 0): ?>
+            <div style="font-family:var(--mono);font-size:10px;color:var(--muted)">
+              <?= ($gphr > 0 ? '+' : '') . fmtGold((int)round($gphr / $c['active'])) ?>/acct
+            </div>
+            <?php endif; ?>
+          </div>
+          <?php if (!$stable && $age > 0): ?>
+          <div style="margin-top:6px;height:2px;background:rgba(26,35,53,.8);border-radius:1px;overflow:hidden">
+            <div style="height:100%;width:<?= min(100, round($age/5*100)) ?>%;background:var(--accent2);border-radius:1px;transition:width 1s"></div>
+          </div>
+          <div style="font-family:var(--mono);font-size:8px;color:var(--muted);margin-top:3px">building confidence · <?= round(max(0,5-$age),1) ?>m until stable</div>
+          <?php endif; ?>
         </div>
       </div>
 
@@ -374,6 +503,11 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
         </div>
       </div>
 
+      <?php if (!empty($c['survival_drop'])): ?>
+      <div style="padding:6px 14px;background:rgba(255,59,92,.06);border-top:1px solid rgba(255,59,92,.15);font-family:var(--mono);font-size:9px;color:var(--danger)">
+        ⚠ SURVIVAL RATE DROPPED — possible ban wave
+      </div>
+      <?php endif; ?>
       <div class="card-foot">
         <span class="foot-note">gp live from ef api · auto-refresh <?= $refreshSec ?>s</span>
         <form method="post">
@@ -403,8 +537,12 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
 (function(){
   let r = <?= $refreshSec ?>;
   const el = document.getElementById('refEl');
-  function t(){ el.textContent = `refresh ${r}s`; if(--r < 0) location.reload(); }
-  t(); setInterval(t, 1000);
+  let iv = setInterval(function(){
+    el.textContent = 'refresh ' + r + 's';
+    r--;
+    if (r < 0) { clearInterval(iv); location.reload(); }
+  }, 1000);
+  el.textContent = 'refresh ' + r + 's';
 })();
 
 // Category dropdown → hidden name

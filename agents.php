@@ -95,13 +95,27 @@ if ($apiKey) {
 $totalOnline       = 0; $totalOffline = 0;
 $totalActiveThreads= 0; $totalCapacity = 0;
 $totalCheckerOn    = 0; $totalBrowserOn = 0;
+$alerts = [];
 foreach ($agents as $a) {
     if ($a['presence_status'] === 'online') $totalOnline++; else $totalOffline++;
     $totalActiveThreads += (int)($a['active_threads'] ?? 0);
     $totalCapacity      += (int)($a['total_capacity'] ?? 0);
     if ($a['checker_enabled']) $totalCheckerOn++;
     if ($a['browser_enabled']) $totalBrowserOn++;
+
+    // Alert: online but 0 active threads and has capacity
+    if ($a['presence_status'] === 'online' && (int)($a['active_threads'] ?? 0) === 0 && (int)($a['total_capacity'] ?? 0) > 0) {
+        $alerts[] = ['type'=>'idle', 'name'=>$a['name']];
+    }
+    // Alert: stale instance_actions_checked_at (>3 min while online)
+    if ($a['presence_status'] === 'online' && !empty($a['instance_actions_checked_at'])) {
+        $staleSec = time() - strtotime($a['instance_actions_checked_at']);
+        if ($staleSec > 180) {
+            $alerts[] = ['type'=>'stale', 'name'=>$a['name'], 'sec'=>$staleSec];
+        }
+    }
 }
+$fleetPct = $totalCapacity > 0 ? round(($totalActiveThreads / $totalCapacity) * 100) : 0;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -152,7 +166,11 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
 .btn-subtle:hover{background:rgba(255,255,255,.07);color:var(--text)}
 
 /* Grand totals */
-.grand-row{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:22px}
+.grand-row{display:grid;grid-template-columns:repeat(7,1fr);gap:12px;margin-bottom:22px}
+.alert-banner{padding:9px 14px;border-radius:6px;font-family:var(--mono);font-size:11px;line-height:1.5}
+.alert-banner strong{font-weight:700}
+.alert-warn{background:rgba(255,184,46,.07);color:var(--warn);border:1px solid rgba(255,184,46,.2)}
+.alert-danger{background:rgba(255,59,92,.07);color:var(--danger);border:1px solid rgba(255,59,92,.2)}
 .gc{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px 16px;position:relative;overflow:hidden}
 .gc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
 .gc.g-online::before{background:linear-gradient(90deg,var(--accent),transparent)}
@@ -234,7 +252,8 @@ tr:hover td{background:rgba(0,255,136,.02)}
 /* Empty */
 .empty-row td{text-align:center;padding:48px;color:var(--muted);font-family:var(--mono);font-size:12px}
 
-@media(max-width:1100px){.grand-row{grid-template-columns:repeat(3,1fr)}}
+@media(max-width:1300px){.grand-row{grid-template-columns:repeat(4,1fr)}}
+@media(max-width:900px){.grand-row{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:700px){.grand-row{grid-template-columns:1fr 1fr}}
 </style>
 </head>
@@ -248,6 +267,7 @@ tr:hover td{background:rgba(0,255,136,.02)}
   <a class="nav-link" href="index.php">Creator GUI</a>
   <a class="nav-link" href="dashboard.php">Account Dashboard</a>
   <a class="nav-link active" href="agents.php">Agent Monitor</a>
+  <a class="nav-link" href="accounts.php">Accounts</a>
   <div class="nav-right">
     <div class="clock" id="clockEl"></div>
     <span class="ref-label" id="refEl"></span>
@@ -276,6 +296,18 @@ tr:hover td{background:rgba(0,255,136,.02)}
   </div>
 
   <!-- Grand totals -->
+  <?php if (!empty($alerts)): ?>
+  <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
+    <?php foreach ($alerts as $al): ?>
+      <?php if ($al['type'] === 'idle'): ?>
+        <div class="alert-banner alert-warn">⚠ <strong><?= htmlspecialchars($al['name']) ?></strong> is ONLINE but has 0 active threads — possible crash or misconfiguration.</div>
+      <?php elseif ($al['type'] === 'stale'): ?>
+        <div class="alert-banner alert-danger">⚠ <strong><?= htmlspecialchars($al['name']) ?></strong> last action check was <?= floor($al['sec']/60) ?>m ago — agent may be frozen.</div>
+      <?php endif; ?>
+    <?php endforeach; ?>
+  </div>
+  <?php endif; ?>
+
   <div class="grand-row">
     <div class="gc g-online">
       <div class="gl">Online</div>
@@ -292,6 +324,14 @@ tr:hover td{background:rgba(0,255,136,.02)}
     <div class="gc g-cap">
       <div class="gl">Total Capacity</div>
       <div class="gv c-purple"><?= number_format($totalCapacity) ?></div>
+    </div>
+    <div class="gc g-util" style="position:relative;overflow:hidden">
+      <div style="content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--accent2),transparent)"></div>
+      <div class="gl">Fleet Utilization</div>
+      <div class="gv" style="color:<?= $fleetPct >= 90 ? 'var(--danger)' : ($fleetPct >= 60 ? 'var(--warn)' : 'var(--accent)') ?>"><?= $fleetPct ?>%</div>
+      <div style="margin-top:6px;height:4px;background:rgba(26,35,53,.8);border-radius:2px;overflow:hidden">
+        <div style="height:100%;width:<?= $fleetPct ?>%;background:<?= $fleetPct >= 90 ? 'var(--danger)' : ($fleetPct >= 60 ? 'var(--warn)' : 'var(--accent)') ?>;border-radius:2px"></div>
+      </div>
     </div>
     <div class="gc g-checker">
       <div class="gl">Checker Enabled</div>
@@ -323,6 +363,7 @@ tr:hover td{background:rgba(0,255,136,.02)}
           <th>Clients</th>
           <th>Version</th>
           <th>Last Seen</th>
+          <th>Last Action</th>
         </tr>
       </thead>
       <tbody>
@@ -447,6 +488,23 @@ tr:hover td{background:rgba(0,255,136,.02)}
             <span class="lastseen <?= $lastSeenClass ?>"><?= timeAgo($lastSeen) ?></span>
           </td>
 
+          <!-- Last action check -->
+          <?php
+            $lastAction = $a['instance_actions_checked_at'] ?? null;
+            $actionDiff = $lastAction ? (time() - strtotime($lastAction)) : 9999;
+            $actionClass = ($online && $actionDiff > 180) ? 'stale' : ($actionDiff < 120 ? 'fresh' : '');
+          ?>
+          <td>
+            <?php if (!$lastAction): ?>
+              <span style="color:var(--muted);font-family:var(--mono);font-size:10px">—</span>
+            <?php else: ?>
+              <span class="lastseen <?= $actionClass ?>"><?= timeAgo($lastAction) ?></span>
+              <?php if ($online && $actionDiff > 180): ?>
+                <div style="font-family:var(--mono);font-size:9px;color:var(--danger);margin-top:2px">FROZEN?</div>
+              <?php endif; ?>
+            <?php endif; ?>
+          </td>
+
         </tr>
         <?php endforeach; ?>
       </tbody>
@@ -463,8 +521,12 @@ tr:hover td{background:rgba(0,255,136,.02)}
 (function(){
   let r = <?= $refreshSec ?>;
   const el = document.getElementById('refEl');
-  function tick(){ el.textContent = `refresh ${r}s`; if(--r < 0) location.reload(); }
-  tick(); setInterval(tick, 1000);
+  el.textContent = 'refresh ' + r + 's';
+  let iv = setInterval(function(){
+    r--;
+    el.textContent = 'refresh ' + r + 's';
+    if (r < 0) { clearInterval(iv); location.reload(); }
+  }, 1000);
 })();
 </script>
 </body>

@@ -622,6 +622,7 @@ textarea{resize:vertical;min-height:80px}
   <a class="nav-link active" href="index.php">Creator GUI</a>
   <a class="nav-link" href="dashboard.php">Account Dashboard</a>
   <a class="nav-link" href="agents.php">Agent Monitor</a>
+  <a class="nav-link" href="accounts.php">Accounts</a>
   <div class="nav-right">
     <div class="status-dot <?= $running ? 'running' : '' ?>"></div>
     <span class="status-label"><?= $running ? 'RUNNING' : 'STOPPED' ?></span>
