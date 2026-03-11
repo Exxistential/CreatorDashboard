@@ -49,7 +49,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'conve
                 $d = json_decode($line, true);
                 if (!$d) { $errors[] = 'Invalid JSON line skipped'; continue; }
 
-                $email    = $d['email']    ?? '';
+                $emailObj = $d['email'] ?? null;
+                if (is_array($emailObj)) {
+                    $email = ($emailObj['username'] ?? '') . '@' . ($emailObj['domain'] ?? '');
+                } else {
+                    $email = (string)($emailObj ?? '');
+                }
                 $password = $d['password'] ?? '';
                 $tfaKey   = $d['tfa']['setup_key'] ?? null;
 
@@ -353,7 +358,8 @@ tr:hover td{background:rgba(0,255,136,.02)}
         <?php endif; ?>
         <?php foreach ($accounts as $i => $acc):
           $num    = $totalAccounts - $i;
-          $email  = $acc['email']    ?? '—';
+          $emailObj = $acc['email'] ?? null;
+          $email  = is_array($emailObj) ? ($emailObj['username'] ?? '') . '@' . ($emailObj['domain'] ?? '') : (string)($emailObj ?? '—');
           $pass   = $acc['password'] ?? '—';
           $tfa    = $acc['tfa']['setup_key'] ?? null;
           $bd     = isset($acc['birthday'])
