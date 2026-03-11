@@ -19,7 +19,66 @@ Content-Length: " . strlen($payload) . "
     @file_get_contents($url, false, $ctx);
 }
 
-if (isset($_GET['status_check']) || isset($_GET['log_tail'])) {
+if (isset($_GET['debug_launch'])) {
+    header('Content-Type: application/json');
+    $gcfg = file_exists($guiCfgPath) ? (json_decode(file_get_contents($guiCfgPath), true) ?? []) : [];
+    $cdir = rtrim($gcfg['creator_dir'] ?? '', '/\\');
+    $uvPath = '';
+    if (!empty($gcfg['uv_path']) && file_exists($gcfg['uv_path'])) {
+        $uvPath = $gcfg['uv_path'];
+    } else {
+        $up = getenv('USERPROFILE') ?: ''; $lp = getenv('LOCALAPPDATA') ?: '';
+        foreach ([$up.'\.local\bin\uv.exe', $lp.'\.local\bin\uv.exe', $lp.'\uv\uv.exe'] as $c)
+            if ($c && file_exists($c)) { $uvPath = $c; break; }
+        if (!$uvPath) $uvPath = '(not found — will try PATH)';
+    }
+    $pyPath = $gcfg['python_path'] ?? '';
+    $uvVerShell = trim((string)@shell_exec('"'.$uvPath.'" --version 2>&1'));
+    $pyVerShell = $pyPath ? trim((string)@shell_exec('"'.$pyPath.'" --version 2>&1'))
+                          : trim((string)@shell_exec('python --version 2>&1'));
+    $logF = $cdir ? $cdir . DIRECTORY_SEPARATOR . 'creator_output.log' : '';
+    // Test proc_open with uv --version
+    $procTest = 'not tested';
+    $uvForProc = ($uvPath && !str_contains($uvPath,'not found')) ? $uvPath : 'uv';
+    if ($cdir && is_dir($cdir)) {
+        $d2 = [0=>['file','NUL','r'],1=>['pipe','r'],2=>['pipe','r']];
+        $p2 = @proc_open([$uvForProc,'--version'], $d2, $pp2, $cdir);
+        if (is_resource($p2)) {
+            $procTest = trim(stream_get_contents($pp2[1])).trim(stream_get_contents($pp2[2]));
+            fclose($pp2[1]); fclose($pp2[2]); proc_close($p2);
+        } else {
+            $procTest = 'proc_open returned false — PHP exec may be disabled or path wrong';
+        }
+    }
+    // Test writing to log file
+    $writeTest = 'not tested';
+    if ($logF) {
+        $ok = @file_put_contents($logF, date('[Y-m-d H:i:s]')." [GUI debug_launch test]\n", FILE_APPEND);
+        $writeTest = ($ok !== false) ? 'ok ('.$ok.' bytes written)' : 'FAILED — check dir permissions';
+    }
+    $pidFile2 = __DIR__ . '/creator.pid';
+    echo json_encode([
+        'os'           => PHP_OS,
+        'php_user'     => function_exists('get_current_user') ? get_current_user() : 'unknown',
+        'creator_dir'  => $cdir,
+        'dir_exists'   => $cdir ? is_dir($cdir) : false,
+        'main_py'      => $cdir ? file_exists($cdir.'/main.py') : false,
+        'config_toml'  => $cdir ? file_exists($cdir.'/config.toml') : false,
+        'log_path'     => $logF,
+        'log_write'    => $writeTest,
+        'uv_path'      => $uvPath,
+        'uv_shell_ver' => $uvVerShell,
+        'uv_proc_ver'  => $procTest,
+        'py_path'      => $pyPath ?: '(auto)',
+        'py_ver'       => $pyVerShell,
+        'pid_file'     => file_exists($pidFile2) ? trim(file_get_contents($pidFile2)) : 'none',
+        'disable_functions' => ini_get('disable_functions'),
+        'safe_mode'    => ini_get('safe_mode'),
+    ], JSON_PRETTY_PRINT);
+    exit;
+}
+
+if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['discord_notify']) || isset($_GET['discord_test'])) {
     $gcfg    = file_exists($guiCfgPath) ? (json_decode(file_get_contents($guiCfgPath), true) ?? []) : [];
     $cdir    = rtrim($gcfg['creator_dir'] ?? '', '/\\');
     $lf      = $cdir ? $cdir . DIRECTORY_SEPARATOR . 'creator_output.log' : '';
@@ -97,22 +156,66 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail'])) {
         if ($webhook) {
             $color = $failed === 0 ? 3066993 : ($created === 0 ? 15158332 : 16776960);
             sendDiscordWebhook($webhook, [
-                'title'       => '✅ Account Creator Finished',
+                'title'       => 'Account Creator Finished',
                 'color'       => $color,
-                'description' => "Creation run completed.",
+                'description' => 'Creation run completed.',
                 'fields'      => [
-                    ['name'=>'✔ Created',       'value'=>(string)$created,              'inline'=>true],
-                    ['name'=>'✖ Failed',         'value'=>(string)$failed,               'inline'=>true],
-                    ['name'=>'Success Rate',      'value'=>$rate.'%',                     'inline'=>true],
-                    ['name'=>'Total Data Used',   'value'=>round($totalMb,2).'MB',        'inline'=>true],
-                    ['name'=>'Avg Data / Account','value'=>$avgMb.'MB',                   'inline'=>true],
+                    ['name'=>'Created',            'value'=>(string)$created,       'inline'=>true],
+                    ['name'=>'Failed',             'value'=>(string)$failed,        'inline'=>true],
+                    ['name'=>'Success Rate',       'value'=>$rate.'%',              'inline'=>true],
+                    ['name'=>'Total Data Used',    'value'=>round($totalMb,2).'MB', 'inline'=>true],
+                    ['name'=>'Avg Data / Account', 'value'=>$avgMb.'MB',            'inline'=>true],
                 ],
-                'footer' => ['text' => 'Jagex Creator · '.date('Y-m-d H:i:s')],
-                'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
+                'footer'    => ['text' => 'Jagex Creator - '.date('Y-m-d H:i:s')],
+                'timestamp' => gmdate("Y-m-d\TH:i:s\Z"),
             ]);
             echo json_encode(['sent' => true]);
         } else {
             echo json_encode(['sent' => false, 'reason' => 'No webhook configured']);
+        }
+        exit;
+    }
+
+    // Test webhook — server-side so no CORS issues
+    if (isset($_GET['discord_test'])) {
+        header('Content-Type: application/json');
+        $webhook = trim($gcfg['discord_webhook'] ?? '');
+        if (!$webhook) {
+            echo json_encode(['sent'=>false,'reason'=>'No webhook URL saved in settings yet.']);
+            exit;
+        }
+        $payload = json_encode(['embeds'=>[[
+            'title'       => 'Webhook Test',
+            'color'       => 3066993,
+            'description' => 'Connection successful! Alerts from Jagex Creator are working.',
+            'footer'      => ['text' => 'Jagex Creator - '.date('Y-m-d H:i:s')],
+            'timestamp'   => gmdate("Y-m-d\TH:i:s\Z"),
+        ]]]);
+        $ctx = stream_context_create(['http' => [
+            'method'        => 'POST',
+            'header'        => "Content-Type: application/json
+Content-Length: ".strlen($payload)."
+",
+            'content'       => $payload,
+            'timeout'       => 8,
+            'ignore_errors' => true,
+        ]]);
+        $result = @file_get_contents($webhook, false, $ctx);
+        $code = 0;
+        if (!empty($http_response_header)) {
+            foreach ($http_response_header as $h) {
+                if (preg_match('#HTTP/\S+\s+(\d+)#', $h, $m)) $code = (int)$m[1];
+            }
+        }
+        if ($code === 204) {
+            echo json_encode(['sent'=>true,'code'=>204]);
+        } else {
+            echo json_encode([
+                'sent'   => false,
+                'code'   => $code,
+                'reason' => $code ? 'Discord returned HTTP '.$code : 'No HTTP response — check server can reach discord.com outbound',
+                'detail' => substr((string)$result, 0, 300),
+            ]);
         }
         exit;
     }
@@ -416,61 +519,81 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Start creator
     if ($action === 'start' && $creatorDir && !$running) {
-        $uv = findUv($gui);
+        $uv  = findUv($gui);
+        $pid = 0;
 
         if (isWindows()) {
-            // Write a small Python launcher script.
-            // Python opens the log file itself — completely independent of Apache/PHP.
-            // This avoids ALL Windows file-locking issues with bat/cmd redirection.
-            $launcher = $creatorDir . '\\gui_launcher.py';
-            $py  = "import subprocess, sys, os\n";
-            $py .= "os.chdir(r'" . $creatorDir . "')\n";
-            $py .= "log = open(r'" . $logFile . "', 'w')\n";
-            $py .= "p = subprocess.Popen(\n";
-            $py .= "    [r'" . $uv . "', 'run', 'main.py'],\n";
-            $py .= "    stdout=log, stderr=log,\n";
-            $py .= "    cwd=r'" . $creatorDir . "',\n";
-            $py .= "    creationflags=0x00000008  # DETACHED_PROCESS\n";
-            $py .= ")\n";
-            $py .= "print(p.pid)\n";
-            $py .= "log.close()\n";
-            file_put_contents($launcher, $py);
+            // ── Windows launch strategy ──────────────────────────────────────
+            // Problem: PHP's proc_open on Windows will block if we wait for output.
+            // Solution: write a .bat file that uses `start /B` to launch uv fully
+            // detached, redirecting output to the log. The bat also writes the uv
+            // PID to a temp file using wmic, then exits immediately.
+            // PHP polls for the PID file for up to 3 seconds, then redirects.
+            //
+            // We use a .bat rather than pythonw because:
+            //  - No Python version discovery needed
+            //  - `start /B` is truly fire-and-forget from cmd.exe
+            //  - wmic gives us the child PID reliably
 
-            // Run the launcher with pythonw (no console window) and capture just the PID
-            $descriptors = [
-                0 => ['file', 'NUL', 'r'],
-                1 => ['pipe', 'w'],
-                2 => ['file', 'NUL', 'w'],
-            ];
-            // Find pythonw.exe or python.exe
-            $pythonw = !empty($gui['python_path']) && file_exists($gui['python_path']) ? $gui['python_path'] : '';
-            if (!$pythonw) foreach ([
-                getenv('LOCALAPPDATA') . '\\Programs\\Python\\Python313\\pythonw.exe',
-                getenv('LOCALAPPDATA') . '\\Programs\\Python\\Python312\\pythonw.exe',
-                getenv('LOCALAPPDATA') . '\\Programs\\Python\\Python311\\pythonw.exe',
-                getenv('LOCALAPPDATA') . '\\Programs\\Python\\Python310\\pythonw.exe',
-                'C:\\Python313\\pythonw.exe',
-                'C:\\Python312\\pythonw.exe',
-                'C:\\Python311\\pythonw.exe',
-                'C:\\Python310\\pythonw.exe',
-                'pythonw.exe',
-                'python.exe',
-            ] as $p) {
-                if ($p && (file_exists($p) || $p === 'pythonw.exe' || $p === 'python.exe')) {
-                    $pythonw = $p; break;
+            $logFileW  = str_replace('/', '\\', $logFile);
+            $uvW       = str_replace('/', '\\', $uv);
+            $dirW      = str_replace('/', '\\', $creatorDir);
+            $pidTmp    = $creatorDir . '\\gui_pid.txt';
+            $pidTmpW   = str_replace('/', '\\', $pidTmp);
+            $batPath   = $creatorDir . '\\gui_start.bat';
+
+            // The bat: cd into dir, launch uv with start /B, capture PID via wmic
+            $bat  = "@echo off\r\n";
+            $bat .= "cd /d \"$dirW\"\r\n";
+            $bat .= "start /B \"creator\" \"$uvW\" run main.py >> \"$logFileW\" 2>&1\r\n";
+            // wmic process where name="uv.exe" get processid — grab last started
+            $bat .= "for /f \"skip=1 tokens=1\" %%P in ('wmic process where \"name='uv.exe'\" get processid 2^>nul') do (\r\n";
+            $bat .= "  echo %%P > \"$pidTmpW\"\r\n";
+            $bat .= ")\r\n";
+            file_put_contents($batPath, $bat);
+
+            // Run the bat via cmd /c — it launches uv detached and exits promptly
+            $descriptors = [0=>['file','NUL','r'], 1=>['file','NUL','w'], 2=>['file','NUL','w']];
+            $proc = proc_open('cmd /c "' . $batPath . '"', $descriptors, $pipes, $creatorDir);
+            if (is_resource($proc)) {
+                proc_close($proc); // cmd /c exits quickly once start /B fires
+            }
+
+            // Poll up to 3s for the PID file
+            for ($i = 0; $i < 30; $i++) {
+                usleep(100000);
+                if (file_exists($pidTmp)) {
+                    $pid = (int)trim(file_get_contents($pidTmp));
+                    @unlink($pidTmp);
+                    if ($pid > 0) break;
                 }
             }
 
-            $proc = proc_open('"' . $pythonw . '" "' . $launcher . '"', $descriptors, $pipes);
-            $pid  = 0;
-            if (is_resource($proc)) {
-                $out = stream_get_contents($pipes[1]);
-                fclose($pipes[1]);
-                proc_close($proc);
-                $pid = (int)trim($out);
+            // Fallback: find uv.exe PID via tasklist if wmic didn't work
+            if ($pid <= 0) {
+                $tl = shell_exec('tasklist /FI "IMAGENAME eq uv.exe" /NH /FO CSV 2>NUL');
+                if ($tl) {
+                    foreach (explode("\n", $tl) as $tline) {
+                        $tline = trim($tline, " \r\n\"");
+                        $parts = str_getcsv($tline);
+                        if (isset($parts[1]) && is_numeric(trim($parts[1]))) {
+                            $pid = (int)trim($parts[1]);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Last resort: write a note to the log so the user sees something
+            if ($pid <= 0) {
+                @file_put_contents($logFile,
+                    date('[Y-m-d H:i:s]') . " [GUI] uv launched via start /B — PID detection failed, process may still be running.\n",
+                    FILE_APPEND
+                );
             }
 
         } else {
+            // Linux/Mac: straightforward background launch
             $cmd = 'cd ' . escapeshellarg($creatorDir)
                  . ' && ' . escapeshellarg($uv)
                  . ' run main.py >> ' . escapeshellarg($logFile)
@@ -773,6 +896,11 @@ textarea{resize:vertical;min-height:80px}
               ■ Stop Creator
             </button>
           </form>
+        </div>
+        <div style="margin-top:10px">
+          <button type="button" class="btn btn-subtle" style="font-size:10px;padding:5px 10px"
+            onclick="debugLaunch()">Diagnose Launch</button>
+          <span id="debugStatus" style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-left:8px"></span>
         </div>
 
         <!-- Bandwidth stats -->
@@ -1134,8 +1262,7 @@ setInterval(() => {
     document.querySelectorAll('.proc-label').forEach(el => { el.innerHTML = 'Status: ' + (on ? '<em>RUNNING</em>' : 'STOPPED'); });
 
     // Fire Discord webhook once when process transitions running→stopped
-    // and there are actual stats to report
-    if (_prevRunning === true && on === false && !_discordNotified && _lastStats.created > 0) {
+    if (_prevRunning === true && on === false && !_discordNotified && (_lastStats.created > 0 || _lastStats.failed > 0)) {
       _discordNotified = true;
       const p = new URLSearchParams({
         discord_notify: 1,
@@ -1152,11 +1279,49 @@ setInterval(() => {
   }).catch(()=>{});
 }, 3000);
 
-function testWebhook() {
-  fetch('?discord_notify=1&created=5&failed=1&total_mb=6.2&avg_mb=1.03')
+function debugLaunch() {
+  const el = document.getElementById('debugStatus');
+  el.textContent = 'running…';
+  fetch('?debug_launch=1')
     .then(r => r.json())
-    .then(d => alert(d.sent ? '✓ Test message sent to Discord!' : 'Not sent: ' + (d.reason || 'unknown')))
-    .catch(() => alert('Request failed'));
+    .then(d => {
+      el.textContent = '';
+      const lines = [];
+      lines.push('OS: ' + d.os + '  PHP user: ' + d.php_user);
+      lines.push('Creator dir: ' + d.creator_dir + (d.dir_exists ? ' ✓' : ' ✗ NOT FOUND'));
+      lines.push('main.py: ' + (d.main_py ? '✓' : '✗') + '  config.toml: ' + (d.config_toml ? '✓' : '✗'));
+      lines.push('Log: ' + d.log_path + '  write: ' + d.log_write);
+      lines.push('uv path: ' + d.uv_path);
+      lines.push('uv shell test: ' + (d.uv_shell_ver || '(no output)'));
+      lines.push('uv proc_open test: ' + (d.uv_proc_ver || '(no output)'));
+      lines.push('Python: ' + d.py_path + '  ver: ' + (d.py_ver || '(no output)'));
+      if (d.disable_functions) lines.push('PHP disabled_functions: ' + d.disable_functions);
+      alert(lines.join('
+'));
+    })
+    .catch(e => { el.textContent = ''; alert('Debug request failed:
+' + e); });
+}
+
+function testWebhook(btn) {
+  const b = btn || document.querySelector('[onclick*="testWebhook"]');
+  const orig = b ? b.textContent : '';
+  if (b) { b.disabled = true; b.textContent = 'Sending…'; }
+  fetch('?discord_test=1')
+    .then(r => r.json())
+    .then(d => {
+      if (d.sent) {
+        toast('✓ Test message sent to Discord!');
+      } else {
+        alert('Webhook test failed:
+' + (d.reason || 'Unknown error') + (d.detail ? '
+
+Detail: ' + d.detail : ''));
+      }
+    })
+    .catch(err => alert('Request failed — is PHP running?
+' + err))
+    .finally(() => { if (b) { b.disabled = false; b.textContent = orig; } });
 }
 </script>
 
