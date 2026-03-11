@@ -345,6 +345,7 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
   <a class="nav-link" href="agents.php">Agent Monitor</a>
   <a class="nav-link" href="accounts.php">Accounts</a>
   <a class="nav-link" href="lifespan.php">Playtime</a>
+  <a class="nav-link" href="mover.php">Trade Mover</a>
   <div class="nav-right">
     <div class="clock" id="clockEl"></div>
     <span class="refresh-label" id="refEl"></span>

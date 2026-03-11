@@ -234,7 +234,8 @@ tr:hover td{background:rgba(0,255,136,.02)}
   <a class="nav-link" href="dashboard.php">Account Dashboard</a>
   <a class="nav-link" href="agents.php">Agent Monitor</a>
   <a class="nav-link active" href="accounts.php">Accounts</a>
-  <a class="nav-link" href="lifespan.php">Lifespan</a>
+  <a class="nav-link" href="lifespan.php">Playtime</a>
+  <a class="nav-link" href="mover.php">Trade Mover</a>
   <div class="nav-right">
     <div class="clock" id="clockEl"></div>
   </div>

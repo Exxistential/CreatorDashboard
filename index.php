@@ -1,5 +1,5 @@
 <?php
-ini_set('memory_limit', '32M'); // streaming reads keep actual usage under 4MB
+ini_set('memory_limit', '32M');
 // ── AJAX endpoints — must be first, before any HTML output ───────────────────
 $guiCfgPath  = __DIR__ . '/gui_config.json';
 $pidFilePath = __DIR__ . '/creator.pid';
@@ -8,80 +8,19 @@ function sendDiscordWebhook(string $url, array $embed): void {
     if (!$url) return;
     $payload = json_encode(['embeds' => [$embed]]);
     $ctx = stream_context_create(['http' => [
-        'method'  => 'POST',
-        'header'  => "Content-Type: application/json
-Content-Length: " . strlen($payload) . "
-",
-        'content' => $payload,
-        'timeout' => 5,
+        'method'        => 'POST',
+        'header'        => "Content-Type: application/json\r\nContent-Length: " . strlen($payload) . "\r\n",
+        'content'       => $payload,
+        'timeout'       => 5,
         'ignore_errors' => true,
     ]]);
     @file_get_contents($url, false, $ctx);
 }
 
-if (isset($_GET['debug_launch'])) {
-    header('Content-Type: application/json');
+if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['discord_notify']) || isset($_GET['discord_test'])) {
     $gcfg = file_exists($guiCfgPath) ? (json_decode(file_get_contents($guiCfgPath), true) ?? []) : [];
     $cdir = rtrim($gcfg['creator_dir'] ?? '', '/\\');
-    $uvPath = '';
-    if (!empty($gcfg['uv_path']) && file_exists($gcfg['uv_path'])) {
-        $uvPath = $gcfg['uv_path'];
-    } else {
-        $up = getenv('USERPROFILE') ?: ''; $lp = getenv('LOCALAPPDATA') ?: '';
-        foreach ([$up.'\.local\bin\uv.exe', $lp.'\.local\bin\uv.exe', $lp.'\uv\uv.exe'] as $c)
-            if ($c && file_exists($c)) { $uvPath = $c; break; }
-        if (!$uvPath) $uvPath = '(not found — will try PATH)';
-    }
-    $pyPath = $gcfg['python_path'] ?? '';
-    $uvVerShell = trim((string)@shell_exec('"'.$uvPath.'" --version 2>&1'));
-    $pyVerShell = $pyPath ? trim((string)@shell_exec('"'.$pyPath.'" --version 2>&1'))
-                          : trim((string)@shell_exec('python --version 2>&1'));
-    $logF = $cdir ? $cdir . DIRECTORY_SEPARATOR . 'creator_output.log' : '';
-    // Test proc_open with uv --version
-    $procTest = 'not tested';
-    $uvForProc = ($uvPath && !str_contains($uvPath,'not found')) ? $uvPath : 'uv';
-    if ($cdir && is_dir($cdir)) {
-        $d2 = [0=>['file','NUL','r'],1=>['pipe','r'],2=>['pipe','r']];
-        $p2 = @proc_open([$uvForProc,'--version'], $d2, $pp2, $cdir);
-        if (is_resource($p2)) {
-            $procTest = trim(stream_get_contents($pp2[1])).trim(stream_get_contents($pp2[2]));
-            fclose($pp2[1]); fclose($pp2[2]); proc_close($p2);
-        } else {
-            $procTest = 'proc_open returned false — PHP exec may be disabled or path wrong';
-        }
-    }
-    // Test writing to log file
-    $writeTest = 'not tested';
-    if ($logF) {
-        $ok = @file_put_contents($logF, date('[Y-m-d H:i:s]')." [GUI debug_launch test]\n", FILE_APPEND);
-        $writeTest = ($ok !== false) ? 'ok ('.$ok.' bytes written)' : 'FAILED — check dir permissions';
-    }
-    $pidFile2 = __DIR__ . '/creator.pid';
-    echo json_encode([
-        'os'           => PHP_OS,
-        'php_user'     => function_exists('get_current_user') ? get_current_user() : 'unknown',
-        'creator_dir'  => $cdir,
-        'dir_exists'   => $cdir ? is_dir($cdir) : false,
-        'main_py'      => $cdir ? file_exists($cdir.'/main.py') : false,
-        'config_toml'  => $cdir ? file_exists($cdir.'/config.toml') : false,
-        'log_path'     => $logF,
-        'log_write'    => $writeTest,
-        'uv_path'      => $uvPath,
-        'uv_shell_ver' => $uvVerShell,
-        'uv_proc_ver'  => $procTest,
-        'py_path'      => $pyPath ?: '(auto)',
-        'py_ver'       => $pyVerShell,
-        'pid_file'     => file_exists($pidFile2) ? trim(file_get_contents($pidFile2)) : 'none',
-        'disable_functions' => ini_get('disable_functions'),
-        'safe_mode'    => ini_get('safe_mode'),
-    ], JSON_PRETTY_PRINT);
-    exit;
-}
-
-if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['discord_notify']) || isset($_GET['discord_test'])) {
-    $gcfg    = file_exists($guiCfgPath) ? (json_decode(file_get_contents($guiCfgPath), true) ?? []) : [];
-    $cdir    = rtrim($gcfg['creator_dir'] ?? '', '/\\');
-    $lf      = $cdir ? $cdir . DIRECTORY_SEPARATOR . 'creator_output.log' : '';
+    $lf   = $cdir ? $cdir . DIRECTORY_SEPARATOR . 'creator_output.log' : '';
 
     if (isset($_GET['status_check'])) {
         header('Content-Type: application/json');
@@ -96,13 +35,18 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['dis
             }
         }
         if (!$on && file_exists($pidFilePath)) @unlink($pidFilePath);
+        // Also clean up lockfile if it exists but process is gone
+        $lf2 = dirname($pidFilePath) . '/creator.lock';
+        if ($on === false && file_exists($lf2)) {
+            // Only remove lock if pid is gone (not just missing)
+            if (!file_exists($pidFilePath)) @unlink($lf2);
+        }
         echo json_encode(['running' => $on]);
         exit;
     }
 
     if (isset($_GET['log_tail'])) {
         header('Content-Type: application/json');
-        // Stream line-by-line — no full file load into RAM
         $lines = []; $created = 0; $failed = 0; $totalMb = 0.0;
         if ($lf && file_exists($lf) && ($fh = @fopen($lf, 'r')) !== false) {
             while (($ln = fgets($fh)) !== false) {
@@ -120,39 +64,28 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['dis
             fclose($fh);
         }
         $avgMb = $created > 0 ? round($totalMb / $created, 2) : 0;
-
-        // Build HTML rows for log
         $html = '';
         foreach ($lines as $line) {
             $cls = '';
             if (stripos($line,'success') !== false || stripos($line,'created') !== false) $cls = 'log-ok';
-            elseif (stripos($line,'error') !== false || stripos($line,'fail') !== false) $cls = 'log-err';
-            elseif (stripos($line,'warning') !== false) $cls = 'log-warn';
-            elseif (stripos($line,'INFO') !== false) $cls = 'log-info';
+            elseif (stripos($line,'error') !== false || stripos($line,'fail') !== false)   $cls = 'log-err';
+            elseif (stripos($line,'warning') !== false)                                     $cls = 'log-warn';
+            elseif (stripos($line,'INFO') !== false)                                        $cls = 'log-info';
             $html .= '<div class="' . htmlspecialchars($cls) . '">' . htmlspecialchars($line) . "</div>\n";
         }
-
-        echo json_encode([
-            'html'     => $html,
-            'lines'    => count($lines),
-            'created'  => $created,
-            'failed'   => $failed,
-            'total_mb' => round($totalMb, 2),
-            'avg_mb'   => $avgMb,
-        ]);
+        echo json_encode(['html'=>$html,'lines'=>count($lines),'created'=>$created,'failed'=>$failed,'total_mb'=>round($totalMb,2),'avg_mb'=>$avgMb]);
         exit;
     }
 
-    // Send Discord notification when creator finishes
     if (isset($_GET['discord_notify'])) {
         header('Content-Type: application/json');
-        $webhook  = trim($gcfg['discord_webhook'] ?? '');
-        $created  = (int)($_GET['created']  ?? 0);
-        $failed   = (int)($_GET['failed']   ?? 0);
-        $totalMb  = (float)($_GET['total_mb'] ?? 0);
-        $avgMb    = (float)($_GET['avg_mb']   ?? 0);
-        $total    = $created + $failed;
-        $rate     = $total > 0 ? round($created / $total * 100, 1) : 0;
+        $webhook = trim($gcfg['discord_webhook'] ?? '');
+        $created = (int)($_GET['created']  ?? 0);
+        $failed  = (int)($_GET['failed']   ?? 0);
+        $totalMb = (float)($_GET['total_mb'] ?? 0);
+        $avgMb   = (float)($_GET['avg_mb']   ?? 0);
+        $total   = $created + $failed;
+        $rate    = $total > 0 ? round($created / $total * 100, 1) : 0;
         if ($webhook) {
             $color = $failed === 0 ? 3066993 : ($created === 0 ? 15158332 : 16776960);
             sendDiscordWebhook($webhook, [
@@ -176,7 +109,7 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['dis
         exit;
     }
 
-    // Test webhook — server-side so no CORS issues
+    // Test webhook — posts directly from the server so there are no CORS issues
     if (isset($_GET['discord_test'])) {
         header('Content-Type: application/json');
         $webhook = trim($gcfg['discord_webhook'] ?? '');
@@ -193,9 +126,7 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['dis
         ]]]);
         $ctx = stream_context_create(['http' => [
             'method'        => 'POST',
-            'header'        => "Content-Type: application/json
-Content-Length: ".strlen($payload)."
-",
+            'header'        => "Content-Type: application/json\r\nContent-Length: ".strlen($payload)."\r\n",
             'content'       => $payload,
             'timeout'       => 8,
             'ignore_errors' => true,
@@ -223,256 +154,154 @@ Content-Length: ".strlen($payload)."
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Jagex Account Creator — GUI (index.php)
-//  Place this file (and dashboard.php) anywhere on a PHP 7.4+ host.
-//  Shared config saved to gui_config.json in the same directory.
 // ═══════════════════════════════════════════════════════════════════════════════
+$guiConfig = __DIR__ . '/gui_config.json';
+$pidFile   = __DIR__ . '/creator.pid';
 
-$guiConfig   = __DIR__ . '/gui_config.json';
-$pidFile     = __DIR__ . '/creator.pid';
-$logFile     = ''; // set dynamically after creatorDir is known — see below
-
-// ── GUI config helpers ─────────────────────────────────────────────────────────
 function loadGui(string $p): array {
-    if (!file_exists($p)) return [
-        'creator_dir' => '',
-        'ef_api_key'  => '',
-    ];
+    if (!file_exists($p)) return [];
     return json_decode(file_get_contents($p), true) ?? [];
 }
 function saveGui(string $p, array $d): void {
     file_put_contents($p, json_encode($d, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 }
 
-// ── TOML helpers (read/write config.toml) ─────────────────────────────────────
+// ── TOML helpers ──────────────────────────────────────────────────────────────
 function readToml(string $path): array {
-    if (!file_exists($path)) return [];
-    // Simple TOML parser sufficient for this config structure
-    $lines   = file($path, FILE_IGNORE_NEW_LINES);
-    $data    = [];
-    $section = [];
-    foreach ($lines as $line) {
+    $cfg = [];
+    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
         $line = trim($line);
-        if ($line === '' || str_starts_with($line, '#')) continue;
-        if (preg_match('/^\[([^\]]+)\]$/', $line, $m)) {
-            $parts   = explode('.', $m[1]);
-            $section = $parts;
-            continue;
+        if ($line === '' || $line[0] === '#') continue;
+        if (preg_match('/^\[(\w+)\]$/', $line)) continue;
+        if (!str_contains($line, '=')) continue;
+        [$k, $v] = array_map('trim', explode('=', $line, 2));
+        if ($v === 'true')  { $cfg[$k] = true;  continue; }
+        if ($v === 'false') { $cfg[$k] = false; continue; }
+        if (preg_match('/^"(.*)"$/', $v, $m))  { $cfg[$k] = $m[1]; continue; }
+        if (preg_match('/^\[(.*)\]$/', $v, $m)) {
+            $items = array_map(fn($i) => trim(trim($i), '"\''), array_filter(explode(',', $m[1]), 'strlen'));
+            $cfg[$k] = $items; continue;
         }
-        if (str_contains($line, '=')) {
-            [$k, $v] = explode('=', $line, 2);
-            $k = trim($k); $v = trim($v);
-            // Strip inline comments
-            $v = preg_replace('/#.*$/', '', $v);
-            $v = trim($v);
-            // Parse value
-            if ($v === 'true')  $val = true;
-            elseif ($v === 'false') $val = false;
-            elseif (is_numeric($v)) $val = $v + 0;
-            elseif (preg_match('/^"(.*)"$/', $v, $m2)) $val = $m2[1];
-            elseif (preg_match('/^\[/', $v)) $val = $v; // raw array, skip
-            else $val = $v;
-            $ref = &$data;
-            foreach ($section as $s) {
-                if (!isset($ref[$s])) $ref[$s] = [];
-                $ref = &$ref[$s];
-            }
-            $ref[$k] = $val;
-        }
+        if (is_numeric($v)) { $cfg[$k] = str_contains($v,'.') ? (float)$v : (int)$v; continue; }
+        $cfg[$k] = $v;
     }
-    return $data;
+    return $cfg;
 }
 
 function buildToml(array $cfg, string $efKey): string {
+    $bool = fn($v) => $v ? 'true' : 'false';
+    $str  = fn($v) => '"' . addslashes((string)$v) . '"';
+    $arr  = fn($a) => '[' . implode(', ', array_map(fn($i)=>'"'.addslashes($i).'"', $a)) . ']';
     $proxies = $cfg['proxies_list'] ?? [];
-    $proxyEnabled = !empty($proxies) ? 'true' : 'false';
-
     $proxyLines = '';
     foreach ($proxies as $p) {
-        $ip   = $p['ip']   ?? '';
-        $port = $p['port'] ?? '';
-        $u    = $p['username'] ?? '';
-        $pw   = $p['password'] ?? '';
-        if ($u)
-            $proxyLines .= "    { ip = \"{$ip}\", port = \"{$port}\", username = \"{$u}\", password = \"{$pw}\" },\n";
-        else
-            $proxyLines .= "    { ip = \"{$ip}\", port = \"{$port}\" },\n";
+        $proxyLines .= "\n  { ip = \"{$p['ip']}\", port = {$p['port']}" .
+            (!empty($p['username']) ? ", username = \"{$p['username']}\", password = \"{$p['password']}\"" : '') . " },";
     }
-
-    $gwDomains = implode(",\n    ", array_map(fn($d) => '"'.$d.'"', $cfg['gw_domains'] ?? [
-        "sharklasers.com","guerrillamail.info","grr.la","guerrillamail.biz",
-        "guerrillamail.com","guerrillamail.de","guerrillamail.net","guerrillamail.org",
-        "pokemail.net","spam4.me"
-    ]));
-
-    $imapDomains = implode(', ', array_map(fn($d) => '"'.$d.'"', array_filter(explode("\n", $cfg['imap_domains'] ?? ''))));
-
-    $password   = $cfg['account_password'] ?? '';
-    $headless   = ($cfg['headless'] ?? false) ? 'true' : 'false';
-    $devTools   = ($cfg['enable_dev_tools'] ?? false) ? 'true' : 'false';
-    $set2fa     = ($cfg['set_2fa'] ?? true) ? 'true' : 'false';
-    $useProxy4Mail = ($cfg['use_proxy_for_temp_mail'] ?? false) ? 'true' : 'false';
-
-    $efSection = $efKey ? "\n[eternal_farm]\napi_key = \"{$efKey}\"\n" : '';
-
-    return <<<TOML
-[account_creator]
-accounts_to_create = {$cfg['accounts_to_create']}
-threads = {$cfg['threads']}
-log_level = "{$cfg['log_level']}"
-
-[browser]
-headless = {$headless}
-enable_dev_tools = {$devTools}
-user_agent = "{$cfg['user_agent']}"
-element_wait_timeout = {$cfg['element_wait_timeout']}
-cache_update_threshold = {$cfg['cache_update_threshold']}
-
-[gproxy]
-log_level = "{$cfg['gproxy_log_level']}"
-
-[email]
-mail_provider = "{$cfg['mail_provider']}"
-use_proxy_for_temp_mail = {$useProxy4Mail}
-
-[email.guerrilla_mail]
-domains = [
-    {$gwDomains},
-]
-
-[email.imap]
-ip = "{$cfg['imap_ip']}"
-port = {$cfg['imap_port']}
-email = "{$cfg['imap_email']}"
-password = "{$cfg['imap_password']}"
-domains = [{$imapDomains}]
-
-[account]
-username_length = {$cfg['username_length']}
-password = "{$password}"
-random_password_length = {$cfg['random_password_length']}
-set_2fa = {$set2fa}
-
-[proxies]
-enabled = {$proxyEnabled}
-list = [
-{$proxyLines}]
-{$efSection}
-TOML;
+    $proxyBlock = $proxyLines ? "[\n{$proxyLines}\n]" : '[]';
+    return "# Jagex Account Creator config.toml\n" .
+        "accounts_to_create     = {$cfg['accounts_to_create']}\n" .
+        "threads                = {$cfg['threads']}\n" .
+        "log_level              = \"{$cfg['log_level']}\"\n" .
+        "headless               = {$bool($cfg['headless'])}\n" .
+        "enable_dev_tools       = {$bool($cfg['enable_dev_tools'])}\n" .
+        "user_agent             = {$str($cfg['user_agent'])}\n" .
+        "element_wait_timeout   = {$cfg['element_wait_timeout']}\n" .
+        "cache_update_threshold = {$cfg['cache_update_threshold']}\n" .
+        "gproxy_log_level       = \"{$cfg['gproxy_log_level']}\"\n" .
+        "mail_provider          = \"{$cfg['mail_provider']}\"\n" .
+        "use_proxy_for_temp_mail = {$bool($cfg['use_proxy_for_temp_mail'])}\n" .
+        "imap_ip                = {$str($cfg['imap_ip'])}\n" .
+        "imap_port              = {$cfg['imap_port']}\n" .
+        "imap_email             = {$str($cfg['imap_email'])}\n" .
+        "imap_password          = {$str($cfg['imap_password'])}\n" .
+        "imap_domains           = {$str($cfg['imap_domains'])}\n" .
+        "gw_domains             = {$arr($cfg['gw_domains'])}\n" .
+        "username_length        = {$cfg['username_length']}\n" .
+        "account_password       = {$str($cfg['account_password'])}\n" .
+        "random_password_length = {$cfg['random_password_length']}\n" .
+        "set_2fa                = {$bool($cfg['set_2fa'])}\n" .
+        "ef_api_key             = {$str($efKey)}\n\n" .
+        "proxies_list = {$proxyBlock}\n";
 }
 
-// ── OS + uv path helpers ──────────────────────────────────────────────────────
-function isWindows(): bool {
-    return strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
+function convertProxies(string $raw): array {
+    $proxies = []; $errors = [];
+    foreach (array_filter(array_map('trim', explode("\n", $raw))) as $line) {
+        $parts = array_map('trim', explode(':', $line));
+        if (count($parts) === 2) {
+            $proxies[] = ['ip'=>$parts[0],'port'=>(int)$parts[1],'username'=>'','password'=>''];
+        } elseif (count($parts) === 4) {
+            $proxies[] = ['ip'=>$parts[0],'port'=>(int)$parts[1],'username'=>$parts[2],'password'=>$parts[3]];
+        } else {
+            $errors[] = "Bad format: $line";
+        }
+    }
+    return ['proxies'=>$proxies,'errors'=>$errors];
 }
+
+function isWindows(): bool { return strtoupper(substr(PHP_OS,0,3)) === 'WIN'; }
 
 function findUv(array $gui): string {
-    // User-specified path takes priority
     if (!empty($gui['uv_path']) && file_exists($gui['uv_path'])) return $gui['uv_path'];
-    if (isWindows()) {
-        $up = getenv('USERPROFILE') ?: '';
-        $ap = getenv('APPDATA')     ?: '';
-        $lp = getenv('LOCALAPPDATA')?: '';
-        $candidates = [
-            $up  . '\.cargo\\bin\\uv.exe',
-            $up  . '\.local\\bin\\uv.exe',
-            $ap  . '\\uv\\uv.exe',
-            $lp  . '\\uv\\uv.exe',
-            $lp  . '\\Programs\\uv\\uv.exe',
-            'C:\\uv\\uv.exe',
-        ];
-    } else {
-        $home = getenv('HOME') ?: '';
-        $candidates = [
-            $home . '/.cargo/bin/uv',
-            $home . '/.local/bin/uv',
-            '/usr/local/bin/uv',
-            '/usr/bin/uv',
-        ];
-    }
-    foreach ($candidates as $c) {
-        if ($c && file_exists($c)) return $c;
-    }
-    // Last resort: hope it's in PATH
-    return isWindows() ? 'uv.exe' : 'uv';
+    $candidates = isWindows()
+        ? [getenv('USERPROFILE').'\.local\bin\uv.exe']
+        : ['/home/'.get_current_user().'/.local/bin/uv', '/usr/local/bin/uv', trim((string)shell_exec('which uv 2>/dev/null'))];
+    foreach ($candidates as $c) { if ($c && file_exists($c)) return $c; }
+    return 'uv';
 }
 
-// ── Process helpers ────────────────────────────────────────────────────────────
 function isRunning(string $pidFile): bool {
+    // Use a lockfile alongside the pidfile — more reliable than PID tracking
+    // since uv spawns child processes and the tracked PID may exit early.
+    $lockFile = dirname($pidFile) . '/creator.lock';
+    if (file_exists($lockFile)) return true;
+    // Fallback: if no lockfile, check pid the old way
     if (!file_exists($pidFile)) return false;
     $pid = (int)file_get_contents($pidFile);
     if ($pid <= 0) return false;
     if (isWindows()) {
-        $out = shell_exec('tasklist /FI "PID eq ' . $pid . '" /NH 2>NUL');
-        return $out && str_contains($out, (string)$pid);
+        $out = shell_exec('tasklist /FI "IMAGENAME eq uv.exe" /NH 2>NUL');
+        if ($out && str_contains($out, 'uv.exe')) return true;
+        $out2 = shell_exec('tasklist /FI "PID eq '.$pid.'" /NH 2>NUL');
+        return $out2 && str_contains($out2, (string)$pid);
     }
     return file_exists("/proc/{$pid}");
 }
 
-// ── Parse bandwidth from log ───────────────────────────────────────────────────
-function parseBandwidth(string $logFile): array {
-    $stats = ['total_mb' => 0.0, 'runs' => [], 'created' => 0, 'failed' => 0];
-    if (!file_exists($logFile)) return $stats;
-    $fh = @fopen($logFile, 'r');
-    if (!$fh) return $stats;
-    while (($line = fgets($fh)) !== false) {
-        if (stripos($line, 'SUCCESS') !== false && preg_match('/Total data used: ([\d.]+)MB/i', $line, $m)) {
-            $stats['total_mb'] += (float)$m[1];
-            $stats['runs'][] = ['mb' => (float)$m[1]];
-            $stats['created']++;
-        }
-        if (preg_match('/Failed creations:\s*([1-9]\d*)/i', $line, $m)) {
-            $stats['failed'] += (int)$m[1];
-        }
-    }
-    fclose($fh);
-    return $stats;
-}
-
-// ── Convert proxies (PHP port of convert_proxies.py) ──────────────────────────
-function convertProxies(string $raw): array {
-    $results = []; $errors = [];
-    foreach (explode("\n", trim($raw)) as $line) {
-        $line = trim($line);
-        if (!$line) continue;
-        $parts = explode(':', $line);
-        if (count($parts) === 2) {
-            $results[] = ['ip'=>$parts[0],'port'=>$parts[1],'username'=>'','password'=>''];
-        } elseif (count($parts) === 4) {
-            $results[] = ['ip'=>$parts[0],'port'=>$parts[1],'username'=>$parts[2],'password'=>$parts[3]];
-        } else {
-            $errors[] = "Invalid format: {$line}";
-        }
-    }
-    return ['proxies'=>$results, 'errors'=>$errors];
-}
-
-// ══ Load state ═════════════════════════════════════════════════════════════════
-$gui = loadGui($guiConfig);
+// ── Load config ───────────────────────────────────────────────────────────────
+$gui        = loadGui($guiConfig);
 $creatorDir = rtrim($gui['creator_dir'] ?? '', '/\\');
-$efApiKey   = $gui['ef_api_key'] ?? '';
-// Log lives inside the creator folder so Apache never holds a lock on it
-$logFile    = $creatorDir ? $creatorDir . DIRECTORY_SEPARATOR . 'creator_output.log' : __DIR__ . '/creator_output.log';
+$efApiKey   = $gui['ef_api_key']      ?? '';
+$discordWh  = $gui['discord_webhook'] ?? '';
 $configPath = $creatorDir ? $creatorDir . '/config.toml' : '';
 $toml       = ($configPath && file_exists($configPath)) ? readToml($configPath) : [];
 $running    = isRunning($pidFile);
-$bw         = parseBandwidth($logFile);
+$logFile    = $creatorDir ? $creatorDir . DIRECTORY_SEPARATOR . 'creator_output.log' : '';
+$logLines   = [];
+if ($logFile && file_exists($logFile) && ($fh = @fopen($logFile,'r')) !== false) {
+    while (($ln = fgets($fh)) !== false) {
+        $ln = rtrim($ln); if ($ln==='') continue;
+        $logLines[] = $ln; if (count($logLines)>120) array_shift($logLines);
+    }
+    fclose($fh);
+}
+$proxyList = $gui['pending_proxies'] ?? ($toml['proxies_list'] ?? []);
 
-// ══ POST handler ═══════════════════════════════════════════════════════════════
+// ── POST handlers ─────────────────────────────────────────────────────────────
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $action = $_POST['action'] ?? '';
 
-    // Save GUI settings (creator dir + EF key)
     if ($action === 'save_gui') {
-        $gui['creator_dir']      = rtrim(trim($_POST['creator_dir'] ?? ''), '/\\');
-        $gui['ef_api_key']       = trim($_POST['ef_api_key'] ?? '');
-        $gui['uv_path']          = trim($_POST['uv_path'] ?? '');
-        $gui['python_path']      = trim($_POST['python_path'] ?? '');
-        $gui['discord_webhook']  = trim($_POST['discord_webhook'] ?? '');
+        $gui['creator_dir']     = rtrim(trim($_POST['creator_dir'] ?? ''), '/\\');
+        $gui['ef_api_key']      = trim($_POST['ef_api_key'] ?? '');
+        $gui['uv_path']         = trim($_POST['uv_path'] ?? '');
+        $gui['python_path']     = trim($_POST['python_path'] ?? '');
+        $gui['discord_webhook'] = trim($_POST['discord_webhook'] ?? '');
         saveGui($guiConfig, $gui);
         header('Location: '.$_SERVER['PHP_SELF'].'?saved=gui'); exit;
     }
 
-    // Save config.toml
     if ($action === 'save_config' && $configPath) {
         $c = [
             'accounts_to_create'     => max(1,(int)$_POST['accounts_to_create']),
@@ -502,163 +331,78 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         header('Location: '.$_SERVER['PHP_SELF'].'?saved=config'); exit;
     }
 
-    // Convert + apply proxies
-    if ($action === 'apply_proxies' && $configPath) {
-        $raw  = $_POST['proxy_raw'] ?? '';
-        $conv = convertProxies($raw);
-        // Re-read toml and inject proxies
-        $existing = readToml($configPath);
-        // Merge current form values from hidden fields
-        $pj = json_encode($conv['proxies']);
-        // Store proxy list in gui config temporarily so save_config can pick it up
+    if ($action === 'apply_proxies') {
+        $conv = convertProxies($_POST['proxy_raw'] ?? '');
         $gui['pending_proxies']      = $conv['proxies'];
         $gui['pending_proxy_errors'] = $conv['errors'];
         saveGui($guiConfig, $gui);
         header('Location: '.$_SERVER['PHP_SELF'].'?saved=proxies'); exit;
     }
 
-    // Start creator
     if ($action === 'start' && $creatorDir && !$running) {
-        $uv  = findUv($gui);
-        $pid = 0;
+        $uv = findUv($gui);
+        $py = $gui['python_path'] ?? '';
+        if (!$py) $py = isWindows() ? 'pythonw' : 'python3';
 
-        if (isWindows()) {
-            // ── Windows launch strategy ──────────────────────────────────────
-            // Problem: PHP's proc_open on Windows will block if we wait for output.
-            // Solution: write a .bat file that uses `start /B` to launch uv fully
-            // detached, redirecting output to the log. The bat also writes the uv
-            // PID to a temp file using wmic, then exits immediately.
-            // PHP polls for the PID file for up to 3 seconds, then redirects.
-            //
-            // We use a .bat rather than pythonw because:
-            //  - No Python version discovery needed
-            //  - `start /B` is truly fire-and-forget from cmd.exe
-            //  - wmic gives us the child PID reliably
+        $launcherPath = $creatorDir . DIRECTORY_SEPARATOR . 'gui_launcher.py';
+        $logPath      = $creatorDir . DIRECTORY_SEPARATOR . 'creator_output.log';
+        $uvEsc        = addslashes($uv);
+        $dirEsc       = addslashes($creatorDir);
+        $logEsc       = addslashes($logPath);
 
-            $logFileW  = str_replace('/', '\\', $logFile);
-            $uvW       = str_replace('/', '\\', $uv);
-            $dirW      = str_replace('/', '\\', $creatorDir);
-            $pidTmp    = $creatorDir . '\\gui_pid.txt';
-            $pidTmpW   = str_replace('/', '\\', $pidTmp);
-            $batPath   = $creatorDir . '\\gui_start.bat';
+        file_put_contents($launcherPath,
+            "import subprocess, sys, os\n" .
+            "os.chdir(r\"{$dirEsc}\")\n" .
+            "log = open(r\"{$logEsc}\", \"a\")\n" .
+            "CREATE_NO_WINDOW = 0x08000000\n" .
+            "DETACHED_PROCESS = 0x00000008\n" .
+            "flags = (CREATE_NO_WINDOW | DETACHED_PROCESS) if sys.platform == 'win32' else 0\n" .
+            "p = subprocess.Popen(\n" .
+            "    [r\"{$uvEsc}\", \"run\", \"main.py\"],\n" .
+            "    cwd=r\"{$dirEsc}\",\n" .
+            "    stdout=log, stderr=log,\n" .
+            "    creationflags=flags,\n" .
+            "    close_fds=True,\n" .
+            ")\n" .
+            "print(p.pid)\n" .
+            "sys.stdout.flush()\n"
+        );
 
-            // The bat: cd into dir, launch uv with start /B, capture PID via wmic
-            $bat  = "@echo off\r\n";
-            $bat .= "cd /d \"$dirW\"\r\n";
-            $bat .= "start /B \"creator\" \"$uvW\" run main.py >> \"$logFileW\" 2>&1\r\n";
-            // wmic process where name="uv.exe" get processid — grab last started
-            $bat .= "for /f \"skip=1 tokens=1\" %%P in ('wmic process where \"name='uv.exe'\" get processid 2^>nul') do (\r\n";
-            $bat .= "  echo %%P > \"$pidTmpW\"\r\n";
-            $bat .= ")\r\n";
-            file_put_contents($batPath, $bat);
-
-            // Run the bat via cmd /c — it launches uv detached and exits promptly
-            $descriptors = [0=>['file','NUL','r'], 1=>['file','NUL','w'], 2=>['file','NUL','w']];
-            $proc = proc_open('cmd /c "' . $batPath . '"', $descriptors, $pipes, $creatorDir);
-            if (is_resource($proc)) {
-                proc_close($proc); // cmd /c exits quickly once start /B fires
-            }
-
-            // Poll up to 3s for the PID file
-            for ($i = 0; $i < 30; $i++) {
-                usleep(100000);
-                if (file_exists($pidTmp)) {
-                    $pid = (int)trim(file_get_contents($pidTmp));
-                    @unlink($pidTmp);
-                    if ($pid > 0) break;
-                }
-            }
-
-            // Fallback: find uv.exe PID via tasklist if wmic didn't work
-            if ($pid <= 0) {
-                $tl = shell_exec('tasklist /FI "IMAGENAME eq uv.exe" /NH /FO CSV 2>NUL');
-                if ($tl) {
-                    foreach (explode("\n", $tl) as $tline) {
-                        $tline = trim($tline, " \r\n\"");
-                        $parts = str_getcsv($tline);
-                        if (isset($parts[1]) && is_numeric(trim($parts[1]))) {
-                            $pid = (int)trim($parts[1]);
-                            break;
-                        }
-                    }
-                }
-            }
-
-            // Last resort: write a note to the log so the user sees something
-            if ($pid <= 0) {
-                @file_put_contents($logFile,
-                    date('[Y-m-d H:i:s]') . " [GUI] uv launched via start /B — PID detection failed, process may still be running.\n",
-                    FILE_APPEND
-                );
-            }
-
-        } else {
-            // Linux/Mac: straightforward background launch
-            $cmd = 'cd ' . escapeshellarg($creatorDir)
-                 . ' && ' . escapeshellarg($uv)
-                 . ' run main.py >> ' . escapeshellarg($logFile)
-                 . ' 2>&1 & echo $!';
-            $pid = (int)trim(shell_exec($cmd));
+        $spec = [1 => ['pipe','r'], 2 => ['pipe','r']];
+        $proc = proc_open([$py, $launcherPath], $spec, $pipes, $creatorDir);
+        if ($proc) {
+            $pid = (int)trim(stream_get_contents($pipes[1]));
+            fclose($pipes[1]); fclose($pipes[2]);
+            proc_close($proc);
+            if ($pid > 0) file_put_contents($pidFile, $pid);
         }
-
-        if ($pid > 0) file_put_contents($pidFile, $pid);
-        header('Location: ' . $_SERVER['PHP_SELF'] . '?started=1'); exit;
-    }
-    // Stop creator
-    if ($action === 'stop' && $running) {
-        $pid = (int)file_get_contents($pidFile);
-        if (isWindows()) {
-            shell_exec('taskkill /PID ' . $pid . ' /F /T 2>NUL');
-        } else {
-            shell_exec("kill {$pid} 2>/dev/null");
-            shell_exec("kill -9 {$pid} 2>/dev/null");
-        }
-        @unlink($pidFile);
-        header('Location: '.$_SERVER['PHP_SELF'].'?stopped=1'); exit;
-    }
-
-    // Clear log
-    if ($action === 'clear_log') {
-        file_put_contents($logFile, '');
+        // Write a lockfile so isRunning() can detect the process reliably
+        $lockFile = dirname($pidFile) . '/creator.lock';
+        file_put_contents($lockFile, date('Y-m-d H:i:s'));
         header('Location: '.$_SERVER['PHP_SELF']); exit;
     }
-}
 
-// ── Derive display values from toml ───────────────────────────────────────────
-$t  = $toml;
-$ac = $t['account_creator'] ?? [];
-$br = $t['browser']         ?? [];
-$gp = $t['gproxy']          ?? [];
-$em = $t['email']           ?? [];
-$gw = $t['email']['guerrilla_mail'] ?? [];
-$im = $t['email']['imap']   ?? [];
-$acc= $t['account']         ?? [];
-$px = $t['proxies']         ?? [];
-
-$gwDomainsTxt  = implode("\n", (array)($gw['domains'] ?? []));
-$imapDomainsTxt= is_array($im['domains'] ?? null) ? implode("\n", $im['domains']) : '';
-$proxyList     = $gui['pending_proxies'] ?? [];
-$proxyErrors   = $gui['pending_proxy_errors'] ?? [];
-$proxyJson     = json_encode($proxyList);
-
-// Log tail (last 120 lines)
-$logLines = [];
-if (file_exists($logFile) && ($fh = @fopen($logFile, 'r')) !== false) {
-    while (($line = fgets($fh)) !== false) {
-        $line = rtrim($line);
-        if ($line === '') continue;
-        $logLines[] = $line;
-        if (count($logLines) > 120) array_shift($logLines);
+    if ($action === 'stop' && $running) {
+        $pid = (int)file_get_contents($pidFile);
+        if (isWindows()) shell_exec('taskkill /FI "IMAGENAME eq uv.exe" /F 2>NUL');
+        else             shell_exec('kill -TERM '.$pid.' 2>/dev/null');
+        @unlink($pidFile);
+        @unlink(dirname($pidFile) . '/creator.lock');
+        header('Location: '.$_SERVER['PHP_SELF']); exit;
     }
-    fclose($fh);
+
+    if ($action === 'clear_log' && $logFile) {
+        @file_put_contents($logFile, '');
+        header('Location: '.$_SERVER['PHP_SELF']); exit;
+    }
 }
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Jagex Creator GUI</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Creator GUI</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Rajdhani:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
@@ -672,9 +416,7 @@ if (file_exists($logFile) && ($fh = @fopen($logFile, 'r')) !== false) {
 body{background:var(--bg);color:var(--text);font-family:var(--head);font-size:14px;min-height:100vh}
 body::before{content:'';position:fixed;inset:0;pointer-events:none;z-index:9999;
   background:repeating-linear-gradient(0deg,transparent,transparent 2px,rgba(0,255,136,.01) 2px,rgba(0,255,136,.01) 4px)}
-
-/* Nav */
-nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 28px;display:flex;align-items:stretch;gap:0}
+nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 28px;display:flex;align-items:stretch}
 .nav-logo{display:flex;align-items:center;gap:10px;padding:12px 20px 12px 0;border-right:1px solid var(--border);margin-right:8px}
 .nav-logo .mark{width:28px;height:28px;border:2px solid var(--accent);border-radius:5px;display:grid;place-items:center;font-family:var(--mono);font-size:13px;color:var(--accent);text-shadow:0 0 6px var(--accent)}
 .nav-logo span{font-size:16px;font-weight:700;letter-spacing:2px;text-transform:uppercase}
@@ -682,110 +424,72 @@ nav{background:var(--surface);border-bottom:1px solid var(--border);padding:0 28
 .nav-link{display:flex;align-items:center;padding:0 18px;font-family:var(--mono);font-size:11px;letter-spacing:1.5px;text-transform:uppercase;color:var(--text2);text-decoration:none;border-bottom:2px solid transparent;transition:all .15s}
 .nav-link:hover{color:var(--text)}
 .nav-link.active{color:var(--accent);border-bottom-color:var(--accent)}
-.nav-right{margin-left:auto;display:flex;align-items:center;gap:10px}
-.status-dot{width:8px;height:8px;border-radius:50%;background:var(--muted)}
-.status-dot.running{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 1.5s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.status-label{font-family:var(--mono);font-size:11px;color:var(--text2)}
-
-/* Layout */
-.wrap{max-width:1380px;margin:0 auto;padding:24px 24px;display:grid;grid-template-columns:1fr 1fr;gap:20px}
-.full{grid-column:1/-1}
-.col{display:flex;flex-direction:column;gap:20px}
-
-/* Panels */
-.panel{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
-.panel-head{padding:11px 16px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;
-  background:linear-gradient(90deg,rgba(0,255,136,.03) 0%,transparent 60%)}
-.panel-head h2{font-family:var(--head);font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--text)}
-.panel-head .ph-sub{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--text2)}
-.panel-body{padding:16px}
+.nav-right{margin-left:auto;display:flex;align-items:center;gap:14px}
+.clock{font-family:var(--mono);font-size:11px;color:var(--text2)}
+.wrap{max-width:1200px;margin:0 auto;padding:24px}
+.cols{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+@media(max-width:900px){.cols{grid-template-columns:1fr}}
+.panel{background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:20px}
 .panel-top-accent{height:2px}
 .panel-top-accent.green{background:linear-gradient(90deg,var(--accent),transparent)}
+.panel-top-accent.red{background:linear-gradient(90deg,var(--danger),transparent)}
 .panel-top-accent.blue{background:linear-gradient(90deg,var(--accent2),transparent)}
 .panel-top-accent.yellow{background:linear-gradient(90deg,var(--warn),transparent)}
-.panel-top-accent.purple{background:linear-gradient(90deg,var(--purple),transparent)}
-.panel-top-accent.red{background:linear-gradient(90deg,var(--danger),transparent)}
-
-/* Forms */
-.fg{display:flex;flex-direction:column;gap:4px;margin-bottom:12px}
-.fg:last-child{margin-bottom:0}
-.fg label{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text2);text-transform:uppercase}
-.fg .hint{font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:3px;line-height:1.4}
-input[type="text"],input[type="number"],input[type="password"],select,textarea{
-  background:var(--surface);border:1px solid var(--border);color:var(--text);
-  font-family:var(--mono);font-size:12px;padding:7px 10px;border-radius:4px;width:100%;outline:none;transition:border-color .15s}
-input:focus,select:focus,textarea:focus{border-color:rgba(0,255,136,.4);box-shadow:0 0 0 2px rgba(0,255,136,.06)}
+.panel-head{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;gap:10px;
+  background:linear-gradient(90deg,rgba(0,255,136,.03),transparent 60%)}
+.panel-head h2{font-size:13px;font-weight:700;letter-spacing:2px;text-transform:uppercase}
+.ph-sub{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--text2)}
+.panel-body{padding:18px}
+label{display:block;font-family:var(--mono);font-size:10px;letter-spacing:2px;text-transform:uppercase;color:var(--text2);margin-bottom:6px}
+.fg{margin-bottom:14px}
+.hint{font-family:var(--mono);font-size:9px;color:var(--muted);margin-top:4px}
+input[type=text],input[type=password],input[type=number],select,textarea{
+  width:100%;background:var(--surface);border:1px solid var(--border);color:var(--text);
+  font-family:var(--mono);font-size:12px;padding:8px 11px;border-radius:4px;outline:none;transition:border-color .15s}
+input:focus,select:focus,textarea:focus{border-color:rgba(0,255,136,.35)}
 textarea{resize:vertical;min-height:80px}
-.inline-check{display:flex;align-items:center;gap:8px;cursor:pointer;font-family:var(--mono);font-size:12px;color:var(--text2)}
-.inline-check input[type="checkbox"]{width:14px;height:14px;accent-color:var(--accent)}
-.form-row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.form-row3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px}
-
-/* Buttons */
-.btn{padding:8px 16px;border-radius:4px;border:none;font-family:var(--head);font-size:12px;font-weight:700;
+.checkbox-row{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.checkbox-row input[type=checkbox]{width:auto;accent-color:var(--accent)}
+.checkbox-row label{margin:0;font-size:10px;letter-spacing:1px}
+.section-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--text2);margin-bottom:8px}
+.divider{border:none;border-top:1px solid var(--border);margin:14px 0}
+.discord-section{border-top:1px solid var(--border);padding-top:14px;margin-top:6px}
+.btn{padding:7px 16px;border-radius:4px;border:none;font-family:var(--head);font-size:12px;font-weight:700;
   letter-spacing:1.5px;text-transform:uppercase;cursor:pointer;transition:all .15s}
-.btn-accent{background:rgba(0,255,136,.1);color:var(--accent);border:1px solid rgba(0,255,136,.25)}
-.btn-accent:hover{background:rgba(0,255,136,.18);box-shadow:0 0 10px rgba(0,255,136,.12)}
-.btn-danger{background:rgba(255,59,92,.1);color:var(--danger);border:1px solid rgba(255,59,92,.25)}
-.btn-danger:hover{background:rgba(255,59,92,.18)}
-.btn-subtle{background:rgba(255,255,255,.03);color:var(--text2);border:1px solid var(--border)}
-.btn-subtle:hover{background:rgba(255,255,255,.07);color:var(--text)}
-.btn-warn{background:rgba(255,184,46,.1);color:var(--warn);border:1px solid rgba(255,184,46,.25)}
-.btn-warn:hover{background:rgba(255,184,46,.18)}
-.btn-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:14px}
-.btn-big{padding:12px 28px;font-size:14px}
+.btn-accent{background:var(--accent);color:#000}
+.btn-accent:hover{background:#00e67a}
+.btn-danger{background:rgba(255,59,92,.15);color:var(--danger);border:1px solid rgba(255,59,92,.3)}
+.btn-danger:hover{background:rgba(255,59,92,.25)}
+.btn-warn{background:rgba(255,184,46,.12);color:var(--warn);border:1px solid rgba(255,184,46,.25)}
+.btn-warn:hover{background:rgba(255,184,46,.2)}
+.btn-subtle{background:rgba(255,255,255,.04);color:var(--text2);border:1px solid var(--border)}
+.btn-subtle:hover{background:rgba(255,255,255,.08);color:var(--text)}
 .btn:disabled{opacity:.35;cursor:not-allowed}
-
-/* Stat cards */
-.stat-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:0}
-.stat-card{background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:12px 14px}
-.stat-card .sl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--text2);text-transform:uppercase;margin-bottom:4px}
-.stat-card .sv{font-family:var(--mono);font-size:20px;line-height:1}
-.sv.green{color:var(--accent)}.sv.red{color:var(--danger)}.sv.blue{color:var(--accent2)}.sv.yellow{color:var(--warn)}
-
-/* Process controls */
-.proc-status{display:flex;align-items:center;gap:12px;padding:12px 16px;background:var(--card2);border-radius:6px;margin-bottom:14px}
-.proc-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
-.proc-dot.on{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 1.5s infinite}
-.proc-dot.off{background:var(--muted)}
-.proc-label{font-family:var(--mono);font-size:12px}
-.proc-label em{font-style:normal;color:var(--accent)}
-.proc-pid{margin-left:auto;font-family:var(--mono);font-size:10px;color:var(--muted)}
-
-/* Log */
-.log-box{background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:10px 12px;
-  font-family:var(--mono);font-size:11px;line-height:1.6;height:300px;overflow-y:auto;color:#7a9ab0}
-.log-box .log-ok{color:var(--accent)}.log-box .log-err{color:var(--danger)}
-.log-box .log-warn{color:var(--warn)}.log-box .log-info{color:var(--accent2)}
-
-/* Proxy output */
-.proxy-out{background:var(--bg);border:1px solid var(--border);border-radius:5px;padding:10px 12px;
-  font-family:var(--mono);font-size:11px;color:var(--accent);max-height:160px;overflow-y:auto}
-.proxy-err{color:var(--danger);font-size:10px;margin-top:4px;font-family:var(--mono)}
-
-/* Toast */
-#toast{position:fixed;bottom:22px;right:22px;background:var(--card);border:1px solid var(--accent);
-  color:var(--accent);font-family:var(--mono);font-size:11px;padding:9px 16px;border-radius:5px;
-  box-shadow:0 0 18px rgba(0,255,136,.12);opacity:0;transform:translateY(8px);
-  transition:all .2s;pointer-events:none;z-index:9999}
-#toast.err{border-color:var(--danger);color:var(--danger)}
-#toast.show{opacity:1;transform:translateY(0)}
-
-/* Banner */
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px}
 .banner{background:rgba(255,184,46,.06);border:1px solid rgba(255,184,46,.2);border-radius:6px;
-  padding:10px 14px;margin-bottom:18px;font-family:var(--mono);font-size:11px;color:var(--warn);
-  display:flex;align-items:center;gap:8px}
-
-/* Section divider */
-.sdiv{height:1px;background:var(--border);margin:14px 0}
-.section-lbl{font-family:var(--mono);font-size:9px;letter-spacing:2px;color:var(--muted);text-transform:uppercase;margin-bottom:10px}
-
-@media(max-width:900px){.wrap{grid-template-columns:1fr}.stat-row{grid-template-columns:1fr 1fr}}
+  padding:10px 16px;margin-bottom:18px;font-family:var(--mono);font-size:11px;color:var(--warn)}
+.banner-ok{background:rgba(0,255,136,.05);border-color:rgba(0,255,136,.2);color:var(--accent)}
+.status-row{display:flex;align-items:center;gap:12px;margin-bottom:16px;padding:12px 14px;
+  background:var(--card2);border-radius:6px;border:1px solid var(--border)}
+.status-dot{width:10px;height:10px;border-radius:50%;background:var(--danger);flex-shrink:0}
+.status-dot.running{background:var(--accent);box-shadow:0 0 8px var(--accent);animation:pulse 1.5s infinite}
+.status-label{font-family:var(--mono);font-size:11px;font-weight:700;letter-spacing:2px;color:var(--danger)}
+.proc-label{font-family:var(--mono);font-size:10px;color:var(--text2);margin-left:auto}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.log-box{background:#060810;border:1px solid var(--border);border-radius:4px;padding:12px;
+  font-family:var(--mono);font-size:11px;line-height:1.6;height:340px;overflow-y:auto;
+  white-space:pre-wrap;word-break:break-all}
+.log-ok{color:var(--accent)}.log-err{color:var(--danger)}.log-warn{color:var(--warn)}.log-info{color:var(--text2)}
+.bw-row{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-bottom:14px}
+.bw-card{background:var(--card2);border:1px solid var(--border);border-radius:6px;padding:10px 12px}
+.bw-label{font-family:var(--mono);font-size:9px;letter-spacing:2px;text-transform:uppercase;color:var(--text2);margin-bottom:4px}
+.bw-val{font-family:var(--mono);font-size:18px;color:var(--accent2)}
+.proxy-err{color:var(--danger);font-family:var(--mono);font-size:10px;margin-top:4px}
+.proxy-list{max-height:120px;overflow-y:auto;background:var(--card2);border:1px solid var(--border);
+  border-radius:4px;padding:8px;font-family:var(--mono);font-size:10px;color:var(--text2);white-space:pre}
 </style>
 </head>
 <body>
-
 <nav>
   <div class="nav-logo">
     <div class="mark">J</div>
@@ -796,535 +500,356 @@ textarea{resize:vertical;min-height:80px}
   <a class="nav-link" href="agents.php">Agent Monitor</a>
   <a class="nav-link" href="accounts.php">Accounts</a>
   <a class="nav-link" href="lifespan.php">Playtime</a>
+  <a class="nav-link" href="mover.php">Trade Mover</a>
   <div class="nav-right">
-    <div class="status-dot <?= $running ? 'running' : '' ?>"></div>
-    <span class="status-label"><?= $running ? 'RUNNING' : 'STOPPED' ?></span>
+    <div class="clock" id="clockEl"></div>
   </div>
 </nav>
 
 <div class="wrap">
 
-  <!-- ── Left column ── -->
-  <div class="col">
+<?php if (isset($_GET['saved'])): $msgs=['gui'=>'Settings saved.','config'=>'config.toml saved.','proxies'=>'Proxies converted — save config to apply.']; ?>
+  <div class="banner banner-ok"><?= htmlspecialchars($msgs[$_GET['saved']] ?? 'Saved.') ?></div>
+<?php endif; ?>
 
-    <!-- Settings -->
-    <div class="panel">
-      <div class="panel-top-accent blue"></div>
-      <div class="panel-head">
-        <h2>⚙ GUI Settings</h2>
-        <span class="ph-sub">creator path + ef key</span>
-      </div>
-      <div class="panel-body">
-        <?php if (!$creatorDir || !file_exists($creatorDir.'/config.toml')): ?>
-        <div class="banner">⚠ Set your creator directory path to load config.toml</div>
-        <?php endif; ?>
-        <form method="post">
-          <input type="hidden" name="action" value="save_gui">
+<?php if (!$creatorDir || !file_exists($creatorDir.'/config.toml')): ?>
+  <div class="banner">&#9888; Set your creator directory below to load config.toml</div>
+<?php endif; ?>
+
+<div class="cols">
+<div><!-- LEFT -->
+
+  <!-- Settings -->
+  <div class="panel">
+    <div class="panel-top-accent blue"></div>
+    <div class="panel-head"><h2>&#9881; Settings</h2><span class="ph-sub">gui_config.json</span></div>
+    <div class="panel-body">
+      <form method="post">
+        <input type="hidden" name="action" value="save_gui">
+        <div class="fg">
+          <label>Creator Directory (absolute path)</label>
+          <input type="text" name="creator_dir" value="<?= htmlspecialchars($creatorDir) ?>"
+            placeholder="/home/user/jagex_account_creator">
+          <div class="hint">Folder containing main.py and config.toml</div>
+        </div>
+        <div class="fg">
+          <label>EternalFarm API Key</label>
+          <input type="password" name="ef_api_key" value="<?= htmlspecialchars($efApiKey) ?>"
+            placeholder="Paste your EF API key…" autocomplete="off">
+          <div class="hint">Used for Account Dashboard and written to config.toml</div>
+        </div>
+        <div class="fg">
+          <label>uv Executable Path <span style="font-weight:400;color:var(--muted)">(optional — leave blank to auto-detect)</span></label>
+          <input type="text" name="uv_path" value="<?= htmlspecialchars($gui['uv_path'] ?? '') ?>"
+            placeholder="e.g. C:\Users\you\.local\bin\uv.exe">
+          <div class="hint">Find it: where uv (Windows) / which uv (Linux)</div>
+        </div>
+        <div class="fg">
+          <label>Python Executable Path <span style="font-weight:400;color:var(--muted)">(optional — leave blank to auto-detect)</span></label>
+          <input type="text" name="python_path" value="<?= htmlspecialchars($gui['python_path'] ?? '') ?>"
+            placeholder="e.g. C:\…\pythonw.exe">
+          <div class="hint">Windows: use pythonw.exe to avoid a terminal window popping up</div>
+        </div>
+
+        <div class="discord-section">
+          <div class="section-lbl">Discord Alerts</div>
           <div class="fg">
-            <label>Creator Directory (absolute path to jagex_account_creator folder)</label>
-            <input type="text" name="creator_dir" value="<?= htmlspecialchars($creatorDir) ?>" placeholder="/home/user/jagex_account_creator">
-            <div class="hint">The folder containing main.py and config.toml</div>
-          </div>
-          <div class="fg">
-            <label>EternalFarm API Key</label>
-            <input type="password" name="ef_api_key"
-              value="<?= htmlspecialchars($efApiKey) ?>"
-              placeholder="Paste your EF API key…"
-              autocomplete="off">
-            <div class="hint">Used for the Account Dashboard page and optionally written to config.toml</div>
-          </div>
-          <div class="fg">
-            <label>uv Executable Path (leave blank to auto-detect)</label>
-            <input type="text" name="uv_path" value="<?= htmlspecialchars($gui['uv_path'] ?? '') ?>"
-              placeholder="e.g. C:\Users\you\.local\bin\uv.exe  or  /home/user/.local/bin/uv">
-            <div class="hint">Full path to uv. Auto-detected if blank. Find it by running: where uv  (Windows) or which uv  (Linux)</div>
-          </div>
-          <div class="fg">
-            <label>Python Executable Path (leave blank to auto-detect)</label>
-            <input type="text" name="python_path" value="<?= htmlspecialchars($gui['python_path'] ?? '') ?>"
-              placeholder="e.g. C:\Users\you\AppData\Local\Programs\Python\Python312\pythonw.exe">
-            <div class="hint">Used to launch the creator on Windows. Find it by running: where pythonw  (or where python)</div>
-          </div>
-          <div class="fg" style="border-top:1px solid var(--border);padding-top:14px;margin-top:4px">
-            <label>Discord Webhook URL <span style="color:var(--muted);font-weight:400;font-size:11px">(optional)</span></label>
+            <label>Webhook URL <span style="font-weight:400;color:var(--muted)">(optional)</span></label>
             <input type="text" name="discord_webhook"
-              value="<?= htmlspecialchars($gui['discord_webhook'] ?? '') ?>"
+              value="<?= htmlspecialchars($discordWh) ?>"
               placeholder="https://discord.com/api/webhooks/…"
               autocomplete="off">
-            <div class="hint">Receives alerts for: creator completion, agent offline/underutilization, ban wave detection. Leave blank to disable.</div>
+            <div class="hint">Alerts: creator finished &middot; agent offline &middot; agent underutilized &middot; ban wave detected</div>
           </div>
-          <div class="btn-row">
-            <button type="submit" class="btn btn-accent">Save Settings</button>
-            <?php if (!empty($gui['discord_webhook'])): ?>
-            <button type="button" class="btn btn-subtle" onclick="testWebhook()">Test Webhook</button>
-            <?php endif; ?>
-          </div>
-        </form>
-      </div>
-    </div>
+        </div>
 
-    <!-- Process Control -->
-    <div class="panel">
-      <div class="panel-top-accent <?= $running ? 'green' : 'red' ?>"></div>
-      <div class="panel-head">
-        <h2>▶ Process Control</h2>
-        <span class="ph-sub"><?= $creatorDir ? htmlspecialchars(basename($creatorDir)) : 'no dir set' ?></span>
-      </div>
-      <div class="panel-body">
-        <div class="proc-status">
-          <div class="proc-dot <?= $running ? 'on' : 'off' ?>"></div>
-          <span class="proc-label">
-            Status: <?= $running ? '<em>RUNNING</em>' : 'STOPPED' ?>
-          </span>
-          <?php if ($running && file_exists($pidFile)): ?>
-            <span class="proc-pid">PID <?= (int)file_get_contents($pidFile) ?></span>
+        <div class="btn-row">
+          <button type="submit" class="btn btn-accent">Save Settings</button>
+          <?php if ($discordWh): ?>
+          <button type="button" class="btn btn-subtle" onclick="testWebhook(this)">Test Webhook</button>
           <?php endif; ?>
         </div>
-
-        <div class="form-row">
-          <form method="post">
-            <input type="hidden" name="action" value="start">
-            <button type="submit" class="btn btn-accent btn-big" style="width:100%"
-              <?= ($running || !$creatorDir) ? 'disabled' : '' ?>>
-              ▶ Start Creator
-            </button>
-          </form>
-          <form method="post">
-            <input type="hidden" name="action" value="stop">
-            <button type="submit" class="btn btn-danger btn-big" style="width:100%"
-              <?= !$running ? 'disabled' : '' ?>>
-              ■ Stop Creator
-            </button>
-          </form>
-        </div>
-        <div style="margin-top:10px">
-          <button type="button" class="btn btn-subtle" style="font-size:10px;padding:5px 10px"
-            onclick="debugLaunch()">Diagnose Launch</button>
-          <span id="debugStatus" style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-left:8px"></span>
-        </div>
-
-        <!-- Bandwidth stats -->
-        <div class="sdiv"></div>
-        <div class="section-lbl">Bandwidth Usage (this session)</div>
-        <div class="stat-row">
-          <div class="stat-card">
-            <div class="sl">Created</div>
-            <div class="sv green" id="bw-created"><?= $bw['created'] ?></div>
-          </div>
-          <div class="stat-card">
-            <div class="sl">Failed</div>
-            <div class="sv red" id="bw-failed"><?= $bw['failed'] ?></div>
-          </div>
-          <div class="stat-card">
-            <div class="sl">Total Data</div>
-            <div class="sv yellow" id="bw-total"><?= number_format($bw['total_mb'], 2) ?>MB</div>
-          </div>
-          <div class="stat-card">
-            <div class="sl">Avg / Acct</div>
-            <div class="sv blue" id="bw-avg">
-              <?= $bw['created'] > 0 ? number_format($bw['total_mb']/$bw['created'],2).'MB' : '—' ?>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Proxy Converter -->
-    <div class="panel">
-      <div class="panel-top-accent yellow"></div>
-      <div class="panel-head">
-        <h2>⇄ Proxy Converter</h2>
-        <span class="ph-sub">host:port:user:pass → toml format</span>
-      </div>
-      <div class="panel-body">
-        <form method="post" id="proxyForm">
-          <input type="hidden" name="action" value="apply_proxies">
-          <div class="fg">
-            <label>Paste Proxies (one per line: ip:port or ip:port:user:pass)</label>
-            <textarea name="proxy_raw" rows="6" placeholder="192.168.1.1:1080:username:password&#10;10.0.0.1:3128&#10;..."><?= htmlspecialchars($_POST['proxy_raw'] ?? '') ?></textarea>
-          </div>
-          <div class="btn-row">
-            <button type="submit" class="btn btn-warn" <?= !$configPath ? 'disabled' : '' ?>>Convert &amp; Apply to Config</button>
-          </div>
-        </form>
-
-        <?php if (!empty($proxyList)): ?>
-        <div class="sdiv"></div>
-        <div class="section-lbl"><?= count($proxyList) ?> proxies converted &amp; pending — save config to apply</div>
-        <div class="proxy-out">
-          <?php foreach ($proxyList as $p): ?>
-            <?php $auth = $p['username'] ? " ({$p['username']}:***)" : ''; ?>
-            <div><?= htmlspecialchars($p['ip'].':'.$p['port'].$auth) ?></div>
-          <?php endforeach; ?>
-        </div>
-        <?php endif; ?>
-        <?php if (!empty($proxyErrors)): ?>
-          <?php foreach ($proxyErrors as $e): ?>
-            <div class="proxy-err">⚠ <?= htmlspecialchars($e) ?></div>
-          <?php endforeach; ?>
-        <?php endif; ?>
-      </div>
-    </div>
-
-  </div><!-- /left col -->
-
-  <!-- ── Right column ── -->
-  <div class="col">
-
-    <!-- Config Editor -->
-    <?php if ($configPath && file_exists($configPath)): ?>
-    <div class="panel">
-      <div class="panel-top-accent green"></div>
-      <div class="panel-head">
-        <h2>📄 config.toml Editor</h2>
-        <span class="ph-sub"><?= htmlspecialchars($configPath) ?></span>
-      </div>
-      <div class="panel-body">
-        <form method="post">
-          <input type="hidden" name="action" value="save_config">
-          <input type="hidden" name="proxies_json" id="proxiesJsonField" value="<?= htmlspecialchars($proxyJson) ?>">
-
-          <!-- Account Creator -->
-          <div class="section-lbl">[ account_creator ]</div>
-          <div class="form-row3">
-            <div class="fg">
-              <label>Accounts to Create</label>
-              <input type="number" name="accounts_to_create" value="<?= (int)($ac['accounts_to_create'] ?? 1) ?>" min="1">
-            </div>
-            <div class="fg">
-              <label>Threads</label>
-              <input type="number" name="threads" value="<?= (int)($ac['threads'] ?? 1) ?>" min="1">
-            </div>
-            <div class="fg">
-              <label>Log Level</label>
-              <select name="log_level">
-                <?php foreach (['DEBUG','INFO','WARNING','ERROR'] as $lvl): ?>
-                  <option <?= ($ac['log_level']??'INFO')===$lvl?'selected':'' ?>><?= $lvl ?></option>
-                <?php endforeach; ?>
-              </select>
-            </div>
-          </div>
-
-          <div class="sdiv"></div>
-          <!-- Browser -->
-          <div class="section-lbl">[ browser ]</div>
-          <div class="form-row" style="margin-bottom:10px">
-            <label class="inline-check">
-              <input type="checkbox" name="headless" <?= ($br['headless']??false)?'checked':'' ?>>
-              Headless Mode
-            </label>
-            <label class="inline-check">
-              <input type="checkbox" name="enable_dev_tools" <?= ($br['enable_dev_tools']??false)?'checked':'' ?>>
-              Enable DevTools
-            </label>
-          </div>
-          <div class="fg">
-            <label>User Agent</label>
-            <input type="text" name="user_agent" value="<?= htmlspecialchars($br['user_agent'] ?? 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36') ?>">
-            <div class="hint">Must match the UA shown in your Chrome at chrome://version</div>
-          </div>
-          <div class="form-row">
-            <div class="fg">
-              <label>Element Wait Timeout (sec)</label>
-              <input type="number" name="element_wait_timeout" value="<?= (int)($br['element_wait_timeout'] ?? 30) ?>" min="5">
-            </div>
-            <div class="fg">
-              <label>Cache Update Threshold</label>
-              <input type="number" name="cache_update_threshold" value="<?= (float)($br['cache_update_threshold'] ?? 0.3) ?>" min="0" max="1" step="0.05">
-            </div>
-          </div>
-
-          <div class="sdiv"></div>
-          <!-- gproxy -->
-          <div class="section-lbl">[ gproxy ]</div>
-          <div class="fg" style="max-width:200px">
-            <label>Log Level</label>
-            <select name="gproxy_log_level">
-              <?php foreach (['DEBUG','INFO','WARNING','ERROR'] as $lvl): ?>
-                <option <?= ($gp['log_level']??'INFO')===$lvl?'selected':'' ?>><?= $lvl ?></option>
-              <?php endforeach; ?>
-            </select>
-          </div>
-
-          <div class="sdiv"></div>
-          <!-- Email -->
-          <div class="section-lbl">[ email ]</div>
-          <div class="form-row" style="margin-bottom:10px">
-            <div class="fg">
-              <label>Mail Provider</label>
-              <select name="mail_provider" id="mailProviderSel">
-                <?php foreach (['xitroo','guerrilla_mail','imap'] as $mp): ?>
-                  <option value="<?= $mp ?>" <?= ($em['mail_provider']??'xitroo')===$mp?'selected':'' ?>><?= $mp ?></option>
-                <?php endforeach; ?>
-              </select>
-            </div>
-            <div class="fg" style="justify-content:flex-end">
-              <label class="inline-check" style="margin-top:22px">
-                <input type="checkbox" name="use_proxy_for_temp_mail" <?= ($em['use_proxy_for_temp_mail']??false)?'checked':'' ?>>
-                Use Proxy for Temp Mail
-              </label>
-            </div>
-          </div>
-
-          <!-- IMAP section -->
-          <div id="imapSection" style="display:none">
-            <div class="section-lbl" style="color:var(--accent2)">[ email.imap ]</div>
-            <div class="form-row">
-              <div class="fg">
-                <label>IMAP IP / Host</label>
-                <input type="text" name="imap_ip" value="<?= htmlspecialchars($im['ip'] ?? '') ?>" placeholder="mail.domain.com">
-              </div>
-              <div class="fg">
-                <label>IMAP Port</label>
-                <input type="number" name="imap_port" value="<?= (int)($im['port'] ?? 993) ?>">
-              </div>
-            </div>
-            <div class="form-row">
-              <div class="fg">
-                <label>Catch-All Email</label>
-                <input type="text" name="imap_email" value="<?= htmlspecialchars($im['email'] ?? '') ?>" placeholder="catchall@domain.com">
-              </div>
-              <div class="fg">
-                <label>IMAP Password</label>
-                <input type="password" name="imap_password" value="<?= htmlspecialchars($im['password'] ?? '') ?>">
-              </div>
-            </div>
-            <div class="fg">
-              <label>IMAP Domains (one per line)</label>
-              <textarea name="imap_domains" rows="3" placeholder="mydomain.com&#10;myotherdomain.net"><?= htmlspecialchars($imapDomainsTxt) ?></textarea>
-            </div>
-          </div>
-
-          <!-- Guerrilla domains -->
-          <div id="gwSection" style="display:none">
-            <div class="section-lbl" style="color:var(--accent2)">[ email.guerrilla_mail ] domains</div>
-            <div class="fg">
-              <label>Domains (one per line)</label>
-              <textarea name="gw_domains" rows="5"><?= htmlspecialchars($gwDomainsTxt) ?></textarea>
-            </div>
-          </div>
-
-          <div class="sdiv"></div>
-          <!-- Account -->
-          <div class="section-lbl">[ account ]</div>
-          <div class="form-row3">
-            <div class="fg">
-              <label>Username Length</label>
-              <input type="number" name="username_length" value="<?= (int)($acc['username_length'] ?? 12) ?>" min="6" max="20">
-            </div>
-            <div class="fg">
-              <label>Rand Password Length</label>
-              <input type="number" name="random_password_length" value="<?= (int)($acc['random_password_length'] ?? 16) ?>" min="8" max="32">
-            </div>
-            <div class="fg" style="justify-content:flex-end">
-              <label class="inline-check" style="margin-top:22px">
-                <input type="checkbox" name="set_2fa" <?= ($acc['set_2fa']??true)?'checked':'' ?>>
-                Set 2FA on Accounts
-              </label>
-            </div>
-          </div>
-          <div class="fg">
-            <label>Fixed Password (blank = random per account)</label>
-            <input type="text" name="account_password" value="<?= htmlspecialchars($acc['password'] ?? '') ?>" placeholder="Leave blank for random">
-          </div>
-
-          <div class="sdiv"></div>
-          <!-- Proxies summary -->
-          <div class="section-lbl">[ proxies ] — <?= count($proxyList) ?> loaded via converter</div>
-          <?php if (empty($proxyList) && !empty($px['list'])): ?>
-            <div style="font-family:var(--mono);font-size:10px;color:var(--text2);margin-bottom:8px">
-              Current config has proxies set. Use Proxy Converter to replace them.
-            </div>
-          <?php elseif (empty($proxyList)): ?>
-            <div style="font-family:var(--mono);font-size:10px;color:var(--muted);margin-bottom:8px">
-              No proxies loaded. Use the Proxy Converter panel to add proxies.
-            </div>
-          <?php endif; ?>
-
-          <div class="btn-row">
-            <button type="submit" class="btn btn-accent btn-big">💾 Save config.toml</button>
-          </div>
-        </form>
-      </div>
-    </div>
-    <?php else: ?>
-    <div class="panel">
-      <div class="panel-top-accent red"></div>
-      <div class="panel-head"><h2>📄 config.toml Editor</h2></div>
-      <div class="panel-body">
-        <div class="banner">⚠ No creator directory set or config.toml not found. Set the path in GUI Settings.</div>
-      </div>
-    </div>
-    <?php endif; ?>
-
-  </div><!-- /right col -->
-
-  <!-- ── Full width: Log ── -->
-  <div class="panel full">
-    <div class="panel-top-accent purple"></div>
-    <div class="panel-head">
-      <h2>📋 Output Log</h2>
-      <span class="ph-sub" id="logLineCount"><?= count($logLines) ?> lines</span>
-      <form method="post" style="margin-left:auto">
-        <input type="hidden" name="action" value="clear_log">
-        <button type="submit" class="btn btn-subtle" style="padding:4px 10px;font-size:10px">Clear</button>
       </form>
     </div>
+  </div>
+
+  <!-- Process Control -->
+  <div class="panel">
+    <div class="panel-top-accent <?= $running ? 'green' : 'red' ?>"></div>
+    <div class="panel-head">
+      <h2>&#9654; Process Control</h2>
+      <span class="ph-sub"><?= $creatorDir ? htmlspecialchars(basename($creatorDir)) : 'no dir set' ?></span>
+    </div>
     <div class="panel-body">
-      <div class="log-box" id="logBox">
-        <?php foreach ($logLines as $line): ?>
-          <?php
-            $cls = '';
-            if (stripos($line,'success') !== false || stripos($line,'created') !== false) $cls = 'log-ok';
-            elseif (stripos($line,'error') !== false || stripos($line,'fail') !== false) $cls = 'log-err';
-            elseif (stripos($line,'warning') !== false) $cls = 'log-warn';
-            elseif (stripos($line,'INFO') !== false) $cls = 'log-info';
-          ?>
-          <div class="<?= $cls ?>"><?= htmlspecialchars($line) ?></div>
-        <?php endforeach; ?>
-        <?php if (empty($logLines)): ?>
-          <div style="color:var(--muted)">No output yet. Start the creator to see logs.</div>
-        <?php endif; ?>
+      <div class="status-row">
+        <div class="status-dot <?= $running ? 'running' : '' ?>"></div>
+        <span class="status-label"><?= $running ? 'RUNNING' : 'STOPPED' ?></span>
+        <span class="proc-label" id="procLbl">Status: <?= $running ? 'RUNNING' : 'STOPPED' ?></span>
+      </div>
+      <div class="btn-row">
+        <form method="post" style="display:inline">
+          <input type="hidden" name="action" value="start">
+          <button type="submit" class="btn btn-accent" id="btnStart" <?= (!$creatorDir||$running)?'disabled':'' ?>>Start</button>
+        </form>
+        <form method="post" style="display:inline">
+          <input type="hidden" name="action" value="stop">
+          <button type="submit" class="btn btn-danger" id="btnStop" <?= !$running?'disabled':'' ?>>Stop</button>
+        </form>
+        <form method="post" style="display:inline">
+          <input type="hidden" name="action" value="clear_log">
+          <button type="submit" class="btn btn-subtle"
+            onclick="return confirm('Clear the log file?')">Clear Log</button>
+        </form>
       </div>
     </div>
   </div>
 
+  <!-- Run Stats -->
+  <div class="panel">
+    <div class="panel-top-accent yellow"></div>
+    <div class="panel-head"><h2>&#128202; Run Stats</h2><span class="ph-sub">from creator_output.log</span></div>
+    <div class="panel-body">
+      <div class="bw-row">
+        <div class="bw-card"><div class="bw-label">Created</div><div class="bw-val" id="bw-created">—</div></div>
+        <div class="bw-card"><div class="bw-label">Failed</div><div class="bw-val" id="bw-failed">—</div></div>
+        <div class="bw-card"><div class="bw-label">Total Data</div><div class="bw-val" id="bw-total">—</div></div>
+        <div class="bw-card"><div class="bw-label">Avg / Acct</div><div class="bw-val" id="bw-avg">—</div></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Proxy Converter -->
+  <div class="panel">
+    <div class="panel-top-accent blue"></div>
+    <div class="panel-head"><h2>&#128260; Proxy Converter</h2></div>
+    <div class="panel-body">
+      <form method="post">
+        <input type="hidden" name="action" value="apply_proxies">
+        <div class="fg">
+          <label>Raw Proxies (ip:port or ip:port:user:pass, one per line)</label>
+          <textarea name="proxy_raw" rows="5" placeholder="1.2.3.4:8080&#10;5.6.7.8:3128:user:pass"></textarea>
+        </div>
+        <button type="submit" class="btn btn-warn" <?= !$configPath?'disabled':'' ?>>Convert &amp; Stage</button>
+      </form>
+      <?php if (!empty($gui['pending_proxy_errors'])): ?>
+        <div class="proxy-err"><?= implode('<br>', array_map('htmlspecialchars', $gui['pending_proxy_errors'])) ?></div>
+      <?php endif; ?>
+      <?php if ($proxyList): ?>
+        <div class="section-lbl" style="margin-top:12px"><?= count($proxyList) ?> proxies staged — save config.toml to apply</div>
+        <div class="proxy-list"><?php foreach ($proxyList as $p) echo htmlspecialchars("{$p['ip']}:{$p['port']}" . (!empty($p['username'])?" [{$p['username']}]":'')) . "\n"; ?></div>
+      <?php endif; ?>
+    </div>
+  </div>
+
+</div><!-- /left -->
+
+<div><!-- RIGHT -->
+
+  <!-- Live Log -->
+  <div class="panel">
+    <div class="panel-top-accent green"></div>
+    <div class="panel-head">
+      <h2>&#128221; Live Log</h2>
+      <span class="ph-sub" id="logLineCount"><?= count($logLines) ?> lines</span>
+    </div>
+    <div class="panel-body">
+      <div class="log-box" id="logBox">
+        <?php if ($logLines): foreach ($logLines as $ln):
+          $cls = '';
+          if (stripos($ln,'success')!==false||stripos($ln,'created')!==false) $cls='log-ok';
+          elseif(stripos($ln,'error')!==false||stripos($ln,'fail')!==false)   $cls='log-err';
+          elseif(stripos($ln,'warning')!==false)                               $cls='log-warn';
+          elseif(stripos($ln,'INFO')!==false)                                  $cls='log-info';
+        ?><div class="<?= $cls ?>"><?= htmlspecialchars($ln) ?></div>
+        <?php endforeach; else: ?><div style="color:var(--muted)">No output yet.</div><?php endif; ?>
+      </div>
+    </div>
+  </div>
+
+  <!-- config.toml Editor -->
+  <?php if ($configPath && file_exists($configPath)): ?>
+  <div class="panel">
+    <div class="panel-top-accent blue"></div>
+    <div class="panel-head">
+      <h2>&#128196; config.toml Editor</h2>
+      <span class="ph-sub"><?= htmlspecialchars($configPath) ?></span>
+    </div>
+    <div class="panel-body">
+      <form method="post">
+        <input type="hidden" name="action" value="save_config">
+        <input type="hidden" name="proxies_json" id="proxiesJsonHidden" value="<?= htmlspecialchars(json_encode($proxyList)) ?>">
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+          <div class="fg">
+            <label>Accounts to Create</label>
+            <input type="number" name="accounts_to_create" value="<?= (int)($toml['accounts_to_create']??10) ?>" min="1">
+          </div>
+          <div class="fg">
+            <label>Threads</label>
+            <input type="number" name="threads" value="<?= (int)($toml['threads']??1) ?>" min="1">
+          </div>
+          <div class="fg">
+            <label>Log Level</label>
+            <select name="log_level">
+              <?php foreach(['DEBUG','INFO','WARNING','ERROR'] as $lv): ?>
+              <option <?= ($toml['log_level']??'INFO')===$lv?'selected':'' ?>><?= $lv ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="fg">
+            <label>gProxy Log Level</label>
+            <select name="gproxy_log_level">
+              <?php foreach(['DEBUG','INFO','WARNING','ERROR'] as $lv): ?>
+              <option <?= ($toml['gproxy_log_level']??'INFO')===$lv?'selected':'' ?>><?= $lv ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="fg">
+            <label>Mail Provider</label>
+            <select name="mail_provider" id="mailProviderSel">
+              <?php foreach(['xitroo','guerrilla_mail','imap'] as $mp): ?>
+              <option value="<?= $mp ?>" <?= ($toml['mail_provider']??'xitroo')===$mp?'selected':'' ?>><?= $mp ?></option>
+              <?php endforeach; ?>
+            </select>
+          </div>
+          <div class="fg">
+            <label>Element Wait Timeout (s)</label>
+            <input type="number" name="element_wait_timeout" value="<?= (int)($toml['element_wait_timeout']??30) ?>" min="5">
+          </div>
+          <div class="fg">
+            <label>Cache Update Threshold</label>
+            <input type="number" name="cache_update_threshold" step="0.01" min="0" max="1"
+              value="<?= number_format((float)($toml['cache_update_threshold']??0.5),2) ?>">
+          </div>
+          <div class="fg">
+            <label>Username Length</label>
+            <input type="number" name="username_length" value="<?= (int)($toml['username_length']??10) ?>" min="6" max="20">
+          </div>
+          <div class="fg">
+            <label>Account Password</label>
+            <input type="text" name="account_password" value="<?= htmlspecialchars($toml['account_password']??'') ?>">
+            <div class="hint">Leave blank to generate random passwords</div>
+          </div>
+          <div class="fg">
+            <label>Random Password Length</label>
+            <input type="number" name="random_password_length" value="<?= (int)($toml['random_password_length']??12) ?>" min="8" max="32">
+          </div>
+        </div>
+
+        <div class="fg">
+          <label>User Agent</label>
+          <input type="text" name="user_agent" value="<?= htmlspecialchars($toml['user_agent']??'') ?>">
+        </div>
+
+        <div style="display:flex;gap:20px;flex-wrap:wrap;margin-bottom:10px">
+          <div class="checkbox-row"><input type="checkbox" name="headless" id="ch_headless" <?= !empty($toml['headless'])?'checked':'' ?>><label for="ch_headless">Headless</label></div>
+          <div class="checkbox-row"><input type="checkbox" name="enable_dev_tools" id="ch_devtools" <?= !empty($toml['enable_dev_tools'])?'checked':'' ?>><label for="ch_devtools">DevTools</label></div>
+          <div class="checkbox-row"><input type="checkbox" name="set_2fa" id="ch_2fa" <?= !empty($toml['set_2fa'])?'checked':'' ?>><label for="ch_2fa">Set 2FA</label></div>
+          <div class="checkbox-row"><input type="checkbox" name="use_proxy_for_temp_mail" id="ch_proxymail" <?= !empty($toml['use_proxy_for_temp_mail'])?'checked':'' ?>><label for="ch_proxymail">Proxy for Temp Mail</label></div>
+        </div>
+
+        <div id="imap_section" style="display:none">
+          <hr class="divider">
+          <div class="section-lbl">IMAP Settings</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+            <div class="fg"><label>IMAP IP</label><input type="text" name="imap_ip" value="<?= htmlspecialchars($toml['imap_ip']??'') ?>"></div>
+            <div class="fg"><label>IMAP Port</label><input type="number" name="imap_port" value="<?= (int)($toml['imap_port']??993) ?>"></div>
+            <div class="fg"><label>IMAP Email</label><input type="text" name="imap_email" value="<?= htmlspecialchars($toml['imap_email']??'') ?>"></div>
+            <div class="fg"><label>IMAP Password</label><input type="password" name="imap_password" value="<?= htmlspecialchars($toml['imap_password']??'') ?>"></div>
+          </div>
+          <div class="fg"><label>IMAP Domains</label><input type="text" name="imap_domains" value="<?= htmlspecialchars($toml['imap_domains']??'') ?>"></div>
+        </div>
+
+        <div id="gw_section" style="display:none">
+          <hr class="divider">
+          <div class="section-lbl">Guerrilla Mail Domains</div>
+          <div class="fg">
+            <textarea name="gw_domains" rows="3"><?= htmlspecialchars(implode("\n", $toml['gw_domains']??[])) ?></textarea>
+            <div class="hint">One domain per line</div>
+          </div>
+        </div>
+
+        <div class="btn-row">
+          <button type="submit" class="btn btn-accent">Save config.toml</button>
+        </div>
+      </form>
+    </div>
+  </div>
+  <?php endif; ?>
+
+</div><!-- /right -->
+</div><!-- /cols -->
 </div><!-- /wrap -->
 
-<div id="toast"></div>
-
 <script>
-// Toast on redirect
-(function(){
-  const p = new URLSearchParams(location.search);
-  const s = p.get('saved'), started = p.get('started'), stopped = p.get('stopped');
-  const msgs = {
-    gui:     '✓ GUI settings saved',
-    config:  '✓ config.toml saved',
-    proxies: '✓ Proxies converted — save config.toml to apply',
-  };
-  const msg = msgs[s] || (started ? '▶ Creator started' : stopped ? '■ Creator stopped' : null);
-  if (msg) {
-    const t = document.getElementById('toast');
-    t.textContent = msg;
-    t.classList.add('show');
-    setTimeout(()=>t.classList.remove('show'), 3000);
-    // Clean URL
-    history.replaceState({}, '', location.pathname);
-  }
-})();
+(function(){ function t(){ document.getElementById('clockEl').textContent=new Date().toLocaleTimeString('en-US',{hour12:false}); } t(); setInterval(t,1000); })();
 
-// Mail provider section toggle
 function toggleMailSections() {
-  const v = document.getElementById('mailProviderSel')?.value;
-  const imap = document.getElementById('imapSection');
-  const gw   = document.getElementById('gwSection');
-  if(imap) imap.style.display = v === 'imap' ? 'block' : 'none';
-  if(gw)   gw.style.display   = v === 'guerrilla_mail' ? 'block' : 'none';
+  const v  = document.getElementById('mailProviderSel')?.value;
+  const im = document.getElementById('imap_section');
+  const gw = document.getElementById('gw_section');
+  if (im) im.style.display = v === 'imap' ? 'block' : 'none';
+  if (gw) gw.style.display = v === 'guerrilla_mail' ? 'block' : 'none';
 }
 document.getElementById('mailProviderSel')?.addEventListener('change', toggleMailSections);
 toggleMailSections();
 
-// Auto-scroll log to bottom
 const lb = document.getElementById('logBox');
 if (lb) lb.scrollTop = lb.scrollHeight;
 
-// Poll log + stats every 3s
 function sv(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
-
-let _prevRunning = null;
-let _lastStats   = {};
-let _discordNotified = false; // only fire once per run completion
+let _prevRunning = null, _lastStats = {}, _discordNotified = false;
 
 setInterval(() => {
-  fetch('?log_tail=1')
-    .then(r => r.json())
-    .then(d => {
-      if (lb) {
-        lb.innerHTML = d.html || '<div style="color:var(--muted)">No output yet.</div>';
-        lb.scrollTop = lb.scrollHeight;
-      }
-      const lc = document.getElementById('logLineCount');
-      if (lc) lc.textContent = (d.lines || 0) + ' lines';
-      sv('bw-created',  d.created  ?? 0);
-      sv('bw-failed',   d.failed   ?? 0);
-      sv('bw-total',    (d.total_mb ?? 0) + 'MB');
-      sv('bw-avg',      d.created > 0 ? (d.avg_mb + 'MB') : '—');
-      _lastStats = d;
-    })
-    .catch(() => {});
+  fetch('?log_tail=1').then(r=>r.json()).then(d=>{
+    if (lb) { lb.innerHTML = d.html || '<div style="color:var(--muted)">No output yet.</div>'; lb.scrollTop = lb.scrollHeight; }
+    const lc = document.getElementById('logLineCount');
+    if (lc) lc.textContent = (d.lines||0)+' lines';
+    sv('bw-created', d.created ?? 0);
+    sv('bw-failed',  d.failed  ?? 0);
+    sv('bw-total',   (d.total_mb ?? 0)+'MB');
+    sv('bw-avg',     d.created > 0 ? (d.avg_mb+'MB') : '—');
+    _lastStats = d;
+  }).catch(()=>{});
 
-  // Status badge + Discord completion alert
   fetch('?status_check=1').then(r=>r.json()).then(d=>{
     const on = d.running;
     document.querySelectorAll('.status-dot').forEach(el => el.classList.toggle('running', on));
     document.querySelectorAll('.status-label').forEach(el => { el.innerHTML = on ? 'RUNNING' : 'STOPPED'; });
-    document.querySelectorAll('.proc-label').forEach(el => { el.innerHTML = 'Status: ' + (on ? '<em>RUNNING</em>' : 'STOPPED'); });
-
-    // Fire Discord webhook once when process transitions running→stopped
+    const pl = document.getElementById('procLbl');
+    if (pl) pl.textContent = 'Status: ' + (on ? 'RUNNING' : 'STOPPED');
+    const bs = document.getElementById('btnStart');
+    const bk = document.getElementById('btnStop');
+    if (bs) bs.disabled = on;
+    if (bk) bk.disabled = !on;
+    // Fire Discord once when run completes
     if (_prevRunning === true && on === false && !_discordNotified && (_lastStats.created > 0 || _lastStats.failed > 0)) {
       _discordNotified = true;
-      const p = new URLSearchParams({
-        discord_notify: 1,
-        created:  _lastStats.created  || 0,
-        failed:   _lastStats.failed   || 0,
-        total_mb: _lastStats.total_mb || 0,
-        avg_mb:   _lastStats.avg_mb   || 0,
-      });
-      fetch('?' + p.toString()).catch(() => {});
+      const p = new URLSearchParams({discord_notify:1, created:_lastStats.created||0, failed:_lastStats.failed||0, total_mb:_lastStats.total_mb||0, avg_mb:_lastStats.avg_mb||0});
+      fetch('?'+p).catch(()=>{});
     }
-    // Reset flag when a new run starts
     if (on && _prevRunning === false) _discordNotified = false;
     _prevRunning = on;
   }).catch(()=>{});
 }, 3000);
 
-function debugLaunch() {
-  const el = document.getElementById('debugStatus');
-  el.textContent = 'running…';
-  fetch('?debug_launch=1')
-    .then(r => r.json())
-    .then(d => {
-      el.textContent = '';
-      const lines = [];
-      lines.push('OS: ' + d.os + '  PHP user: ' + d.php_user);
-      lines.push('Creator dir: ' + d.creator_dir + (d.dir_exists ? ' ✓' : ' ✗ NOT FOUND'));
-      lines.push('main.py: ' + (d.main_py ? '✓' : '✗') + '  config.toml: ' + (d.config_toml ? '✓' : '✗'));
-      lines.push('Log: ' + d.log_path + '  write: ' + d.log_write);
-      lines.push('uv path: ' + d.uv_path);
-      lines.push('uv shell test: ' + (d.uv_shell_ver || '(no output)'));
-      lines.push('uv proc_open test: ' + (d.uv_proc_ver || '(no output)'));
-      lines.push('Python: ' + d.py_path + '  ver: ' + (d.py_ver || '(no output)'));
-      if (d.disable_functions) lines.push('PHP disabled_functions: ' + d.disable_functions);
-      alert(lines.join('
-'));
-    })
-    .catch(e => { el.textContent = ''; alert('Debug request failed:
-' + e); });
-}
-
+// Test webhook — routes through PHP to avoid CORS
 function testWebhook(btn) {
-  const b = btn || document.querySelector('[onclick*="testWebhook"]');
-  const orig = b ? b.textContent : '';
-  if (b) { b.disabled = true; b.textContent = 'Sending…'; }
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
   fetch('?discord_test=1')
     .then(r => r.json())
     .then(d => {
       if (d.sent) {
-        toast('✓ Test message sent to Discord!');
+        alert('Test message sent to Discord successfully!');
       } else {
-        alert('Webhook test failed:
-' + (d.reason || 'Unknown error') + (d.detail ? '
-
-Detail: ' + d.detail : ''));
+        alert('Failed:\n' + (d.reason || 'Unknown error') + (d.detail ? '\n\nDetail: ' + d.detail : ''));
       }
     })
-    .catch(err => alert('Request failed — is PHP running?
-' + err))
-    .finally(() => { if (b) { b.disabled = false; b.textContent = orig; } });
+    .catch(err => alert('Request failed — is PHP running?\n' + err))
+    .finally(() => { btn.disabled = false; btn.textContent = orig; });
 }
 </script>
-
-
 </body>
 </html>
