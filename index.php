@@ -24,23 +24,8 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail']) || isset($_GET['dis
 
     if (isset($_GET['status_check'])) {
         header('Content-Type: application/json');
-        $pid = file_exists($pidFilePath) ? (int)file_get_contents($pidFilePath) : 0;
-        $on  = false;
-        if ($pid > 0) {
-            if (strtoupper(substr(PHP_OS,0,3)) === 'WIN') {
-                $out = shell_exec('tasklist /FI "PID eq ' . $pid . '" /NH 2>NUL');
-                $on  = $out && str_contains($out, (string)$pid);
-            } else {
-                $on = file_exists("/proc/{$pid}");
-            }
-        }
-        if (!$on && file_exists($pidFilePath)) @unlink($pidFilePath);
-        // Also clean up lockfile if it exists but process is gone
-        $lf2 = dirname($pidFilePath) . '/creator.lock';
-        if ($on === false && file_exists($lf2)) {
-            // Only remove lock if pid is gone (not just missing)
-            if (!file_exists($pidFilePath)) @unlink($lf2);
-        }
+        $flagFile = dirname($pidFilePath) . '/creator_running.flag';
+        $on = file_exists($flagFile);
         echo json_encode(['running' => $on]);
         exit;
     }
@@ -168,61 +153,193 @@ function saveGui(string $p, array $d): void {
 
 // ── TOML helpers ──────────────────────────────────────────────────────────────
 function readToml(string $path): array {
-    $cfg = [];
-    foreach (file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $line) {
-        $line = trim($line);
-        if ($line === '' || $line[0] === '#') continue;
-        if (preg_match('/^\[(\w+)\]$/', $line)) continue;
-        if (!str_contains($line, '=')) continue;
-        [$k, $v] = array_map('trim', explode('=', $line, 2));
-        if ($v === 'true')  { $cfg[$k] = true;  continue; }
-        if ($v === 'false') { $cfg[$k] = false; continue; }
-        if (preg_match('/^"(.*)"$/', $v, $m))  { $cfg[$k] = $m[1]; continue; }
-        if (preg_match('/^\[(.*)\]$/', $v, $m)) {
-            $items = array_map(fn($i) => trim(trim($i), '"\''), array_filter(explode(',', $m[1]), 'strlen'));
-            $cfg[$k] = $items; continue;
+    // Returns a FLAT key map for the GUI fields, extracting values from the
+    // nested TOML structure that jagex_account_creator expects.
+    $raw = [];
+    $section = '';
+    $multiline = null; // [key, buffer]
+    foreach (file($path, FILE_IGNORE_NEW_LINES) as $line) {
+        $trimmed = trim($line);
+        // Handle multi-line arrays (e.g. proxies list = [\n ...\n])
+        if ($multiline !== null) {
+            $multiline[1] .= "\n" . $line;
+            if (str_contains($line, ']')) {
+                $raw[$multiline[0]] = $multiline[1];
+                $multiline = null;
+            }
+            continue;
         }
-        if (is_numeric($v)) { $cfg[$k] = str_contains($v,'.') ? (float)$v : (int)$v; continue; }
-        $cfg[$k] = $v;
+        if ($trimmed === '' || $trimmed[0] === '#') continue;
+        if (preg_match('/^\[([a-zA-Z0-9_.]+)\]$/', $trimmed, $m)) {
+            $section = $m[1];
+            continue;
+        }
+        if (!str_contains($trimmed, '=')) continue;
+        [$k, $v] = array_map('trim', explode('=', $trimmed, 2));
+        $fullKey = $section ? $section . '.' . $k : $k;
+        // Detect start of multi-line array
+        if (str_contains($v, '[') && !str_contains($v, ']')) {
+            $multiline = [$fullKey, $v];
+            continue;
+        }
+        $raw[$fullKey] = $v;
     }
-    return $cfg;
+    // Parse values
+    $parsed = [];
+    foreach ($raw as $fullKey => $v) {
+        $v = trim($v);
+        // Strip inline comments: only outside strings
+        if ($v !== '' && $v[0] !== '"' && $v[0] !== '[') {
+            $v = preg_replace('/\s+#.*$/', '', $v);
+        }
+        if ($v === 'true')  { $parsed[$fullKey] = true;  continue; }
+        if ($v === 'false') { $parsed[$fullKey] = false; continue; }
+        if (preg_match('/^"(.*)"$/', $v, $m)) { $parsed[$fullKey] = $m[1]; continue; }
+        if ($v !== '' && $v[0] === '[') {
+            // Parse array — could be simple strings or inline tables
+            if (str_contains($v, '{')) {
+                // Inline table array (proxies)
+                preg_match_all('/\{([^}]+)\}/', $v, $tables);
+                $items = [];
+                foreach ($tables[1] as $tbl) {
+                    $obj = [];
+                    foreach (explode(',', $tbl) as $pair) {
+                        if (!str_contains($pair, '=')) continue;
+                        [$pk, $pv] = array_map('trim', explode('=', $pair, 2));
+                        $obj[$pk] = trim($pv, ' "');
+                    }
+                    if ($obj) $items[] = $obj;
+                }
+                $parsed[$fullKey] = $items;
+            } else {
+                // Simple array of strings
+                $inner = trim($v, '[] ');
+                $items = $inner ? array_map(fn($i) => trim(trim($i), '"\''), array_filter(explode(',', $inner), fn($s) => trim($s) !== '')) : [];
+                $parsed[$fullKey] = $items;
+            }
+            continue;
+        }
+        if (is_numeric($v)) { $parsed[$fullKey] = str_contains($v,'.') ? (float)$v : (int)$v; continue; }
+        $parsed[$fullKey] = $v;
+    }
+    // Map nested TOML keys → flat GUI keys for the form fields
+    $flat = [];
+    $map = [
+        'account_creator.accounts_to_create' => 'accounts_to_create',
+        'account_creator.threads'            => 'threads',
+        'account_creator.log_level'          => 'log_level',
+        'browser.headless'                   => 'headless',
+        'browser.enable_dev_tools'           => 'enable_dev_tools',
+        'browser.user_agent'                 => 'user_agent',
+        'browser.element_wait_timeout'       => 'element_wait_timeout',
+        'browser.cache_update_threshold'     => 'cache_update_threshold',
+        'gproxy.log_level'                   => 'gproxy_log_level',
+        'email.mail_provider'                => 'mail_provider',
+        'email.use_proxy_for_temp_mail'      => 'use_proxy_for_temp_mail',
+        'email.imap.ip'                      => 'imap_ip',
+        'email.imap.port'                    => 'imap_port',
+        'email.imap.email'                   => 'imap_email',
+        'email.imap.password'                => 'imap_password',
+        'email.imap.domains'                 => 'imap_domains',
+        'email.guerrilla_mail.domains'       => 'gw_domains',
+        'account.username_length'            => 'username_length',
+        'account.password'                   => 'account_password',
+        'account.random_password_length'     => 'random_password_length',
+        'account.set_2fa'                    => 'set_2fa',
+        'proxies.enabled'                    => 'proxies_enabled',
+        'proxies.list'                       => 'proxies_list',
+    ];
+    foreach ($map as $tomlKey => $guiKey) {
+        if (array_key_exists($tomlKey, $parsed)) {
+            $flat[$guiKey] = $parsed[$tomlKey];
+        }
+    }
+    // Also keep any flat/unmapped keys (e.g. ef_api_key if present at root)
+    foreach ($parsed as $k => $v) {
+        if (!str_contains($k, '.') && !isset($flat[$k])) {
+            $flat[$k] = $v;
+        }
+    }
+    return $flat;
 }
 
 function buildToml(array $cfg, string $efKey): string {
     $bool = fn($v) => $v ? 'true' : 'false';
     $str  = fn($v) => '"' . addslashes((string)$v) . '"';
-    $arr  = fn($a) => '[' . implode(', ', array_map(fn($i)=>'"'.addslashes($i).'"', $a)) . ']';
+
+    // Build proxies list block
     $proxies = $cfg['proxies_list'] ?? [];
     $proxyLines = '';
     foreach ($proxies as $p) {
-        $proxyLines .= "\n  { ip = \"{$p['ip']}\", port = {$p['port']}" .
+        $port = is_numeric($p['port']) ? (int)$p['port'] : '"'.$p['port'].'"';
+        $proxyLines .= "\n    { ip = \"{$p['ip']}\", port = {$port}" .
             (!empty($p['username']) ? ", username = \"{$p['username']}\", password = \"{$p['password']}\"" : '') . " },";
     }
     $proxyBlock = $proxyLines ? "[\n{$proxyLines}\n]" : '[]';
-    return "# Jagex Account Creator config.toml\n" .
-        "accounts_to_create     = {$cfg['accounts_to_create']}\n" .
-        "threads                = {$cfg['threads']}\n" .
-        "log_level              = \"{$cfg['log_level']}\"\n" .
-        "headless               = {$bool($cfg['headless'])}\n" .
-        "enable_dev_tools       = {$bool($cfg['enable_dev_tools'])}\n" .
-        "user_agent             = {$str($cfg['user_agent'])}\n" .
-        "element_wait_timeout   = {$cfg['element_wait_timeout']}\n" .
-        "cache_update_threshold = {$cfg['cache_update_threshold']}\n" .
-        "gproxy_log_level       = \"{$cfg['gproxy_log_level']}\"\n" .
-        "mail_provider          = \"{$cfg['mail_provider']}\"\n" .
-        "use_proxy_for_temp_mail = {$bool($cfg['use_proxy_for_temp_mail'])}\n" .
-        "imap_ip                = {$str($cfg['imap_ip'])}\n" .
-        "imap_port              = {$cfg['imap_port']}\n" .
-        "imap_email             = {$str($cfg['imap_email'])}\n" .
-        "imap_password          = {$str($cfg['imap_password'])}\n" .
-        "imap_domains           = {$str($cfg['imap_domains'])}\n" .
-        "gw_domains             = {$arr($cfg['gw_domains'])}\n" .
-        "username_length        = {$cfg['username_length']}\n" .
-        "account_password       = {$str($cfg['account_password'])}\n" .
-        "random_password_length = {$cfg['random_password_length']}\n" .
-        "set_2fa                = {$bool($cfg['set_2fa'])}\n" .
-        "ef_api_key             = {$str($efKey)}\n\n" .
-        "proxies_list = {$proxyBlock}\n";
+
+    // Build guerrilla mail domains array
+    $gwDomains = $cfg['gw_domains'] ?? [];
+    $gwBlock = "[\n";
+    foreach ($gwDomains as $d) {
+        $gwBlock .= "    \"" . addslashes($d) . "\",\n";
+    }
+    $gwBlock .= "]";
+    if (!$gwDomains) $gwBlock = '[]';
+
+    // IMAP domains — could be a comma-separated string or array
+    $imapDomains = $cfg['imap_domains'] ?? '';
+    if (is_string($imapDomains) && $imapDomains !== '') {
+        $imapDomainsArr = array_filter(array_map('trim', explode(',', $imapDomains)));
+    } elseif (is_array($imapDomains)) {
+        $imapDomainsArr = $imapDomains;
+    } else {
+        $imapDomainsArr = [];
+    }
+    $imapDomainsBlock = '[' . implode(', ', array_map(fn($d) => '"'.addslashes($d).'"', $imapDomainsArr)) . ']';
+
+    return <<<TOML
+# Jagex Account Creator config.toml
+
+[account_creator]
+accounts_to_create = {$cfg['accounts_to_create']}
+threads = {$cfg['threads']}
+log_level = "{$cfg['log_level']}"
+
+[browser]
+headless = {$bool($cfg['headless'])}
+enable_dev_tools = {$bool($cfg['enable_dev_tools'])}
+user_agent = {$str($cfg['user_agent'])}
+element_wait_timeout = {$cfg['element_wait_timeout']}
+cache_update_threshold = {$cfg['cache_update_threshold']}
+
+[gproxy]
+log_level = "{$cfg['gproxy_log_level']}"
+
+[email]
+mail_provider = "{$cfg['mail_provider']}"
+use_proxy_for_temp_mail = {$bool($cfg['use_proxy_for_temp_mail'])}
+
+[email.guerrilla_mail]
+domains = {$gwBlock}
+
+[email.imap]
+ip = {$str($cfg['imap_ip'])}
+port = {$cfg['imap_port']}
+email = {$str($cfg['imap_email'])}
+password = {$str($cfg['imap_password'])}
+domains = {$imapDomainsBlock}
+
+[account]
+username_length = {$cfg['username_length']}
+password = {$str($cfg['account_password'])}
+random_password_length = {$cfg['random_password_length']}
+set_2fa = {$bool($cfg['set_2fa'])}
+
+[proxies]
+enabled = {$bool(!empty($proxies))}
+list = {$proxyBlock}
+
+TOML;
 }
 
 function convertProxies(string $raw): array {
@@ -252,21 +369,9 @@ function findUv(array $gui): string {
 }
 
 function isRunning(string $pidFile): bool {
-    // Use a lockfile alongside the pidfile — more reliable than PID tracking
-    // since uv spawns child processes and the tracked PID may exit early.
-    $lockFile = dirname($pidFile) . '/creator.lock';
-    if (file_exists($lockFile)) return true;
-    // Fallback: if no lockfile, check pid the old way
-    if (!file_exists($pidFile)) return false;
-    $pid = (int)file_get_contents($pidFile);
-    if ($pid <= 0) return false;
-    if (isWindows()) {
-        $out = shell_exec('tasklist /FI "IMAGENAME eq uv.exe" /NH 2>NUL');
-        if ($out && str_contains($out, 'uv.exe')) return true;
-        $out2 = shell_exec('tasklist /FI "PID eq '.$pid.'" /NH 2>NUL');
-        return $out2 && str_contains($out2, (string)$pid);
-    }
-    return file_exists("/proc/{$pid}");
+    // The launcher writes creator_running.flag on start and deletes it on finish.
+    $flagFile = dirname($pidFile) . '/creator_running.flag';
+    return file_exists($flagFile);
 }
 
 // ── Load config ───────────────────────────────────────────────────────────────
@@ -346,46 +451,75 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $launcherPath = $creatorDir . DIRECTORY_SEPARATOR . 'gui_launcher.py';
         $logPath      = $creatorDir . DIRECTORY_SEPARATOR . 'creator_output.log';
+        $flagPath     = dirname($pidFile) . DIRECTORY_SEPARATOR . 'creator_running.flag';
         $uvEsc        = addslashes($uv);
         $dirEsc       = addslashes($creatorDir);
         $logEsc       = addslashes($logPath);
+        $flagEsc      = addslashes($flagPath);
 
+        // The launcher:
+        // 1. Writes a "running" flag file immediately
+        // 2. Starts uv run main.py, redirecting output to the log
+        // 3. Waits for the child to finish
+        // 4. Deletes the flag file when done
+        // This way we can detect running state via the flag file, which is
+        // reliable regardless of PID tracking issues with uv's process tree.
         file_put_contents($launcherPath,
-            "import subprocess, sys, os\n" .
+            "import subprocess, sys, os, signal\n" .
             "os.chdir(r\"{$dirEsc}\")\n" .
+            "flag = r\"{$flagEsc}\"\n" .
+            "with open(flag, 'w') as f:\n" .
+            "    f.write(str(os.getpid()))\n" .
             "log = open(r\"{$logEsc}\", \"a\")\n" .
-            "CREATE_NO_WINDOW = 0x08000000\n" .
-            "DETACHED_PROCESS = 0x00000008\n" .
-            "flags = (CREATE_NO_WINDOW | DETACHED_PROCESS) if sys.platform == 'win32' else 0\n" .
-            "p = subprocess.Popen(\n" .
-            "    [r\"{$uvEsc}\", \"run\", \"main.py\"],\n" .
-            "    cwd=r\"{$dirEsc}\",\n" .
-            "    stdout=log, stderr=log,\n" .
-            "    creationflags=flags,\n" .
-            "    close_fds=True,\n" .
-            ")\n" .
-            "print(p.pid)\n" .
-            "sys.stdout.flush()\n"
+            "try:\n" .
+            "    p = subprocess.Popen(\n" .
+            "        [r\"{$uvEsc}\", \"run\", \"main.py\"],\n" .
+            "        cwd=r\"{$dirEsc}\",\n" .
+            "        stdout=log, stderr=log,\n" .
+            "    )\n" .
+            "    p.wait()\n" .
+            "except Exception:\n" .
+            "    pass\n" .
+            "finally:\n" .
+            "    log.close()\n" .
+            "    try:\n" .
+            "        os.remove(flag)\n" .
+            "    except OSError:\n" .
+            "        pass\n"
         );
 
-        $spec = [1 => ['pipe','r'], 2 => ['pipe','r']];
-        $proc = proc_open([$py, $launcherPath], $spec, $pipes, $creatorDir);
-        if ($proc) {
-            $pid = (int)trim(stream_get_contents($pipes[1]));
-            fclose($pipes[1]); fclose($pipes[2]);
-            proc_close($proc);
-            if ($pid > 0) file_put_contents($pidFile, $pid);
+        // Launch the wrapper in the background
+        if (isWindows()) {
+            // Use 'start /B' to run pythonw in background; the wrapper stays alive
+            // until uv finishes, then removes the flag.
+            $cmd = 'start /B "" "' . $py . '" "' . $launcherPath . '"';
+            pclose(popen($cmd, 'r'));
+        } else {
+            $cmd = escapeshellarg($py) . ' ' . escapeshellarg($launcherPath) . ' &';
+            exec($cmd);
         }
-        // Write a lockfile so isRunning() can detect the process reliably
-        $lockFile = dirname($pidFile) . '/creator.lock';
-        file_put_contents($lockFile, date('Y-m-d H:i:s'));
+
+        // Write the flag ourselves as well in case the launcher takes a moment
+        file_put_contents($flagPath, date('Y-m-d H:i:s'));
         header('Location: '.$_SERVER['PHP_SELF']); exit;
     }
 
     if ($action === 'stop' && $running) {
-        $pid = (int)file_get_contents($pidFile);
-        if (isWindows()) shell_exec('taskkill /FI "IMAGENAME eq uv.exe" /F 2>NUL');
-        else             shell_exec('kill -TERM '.$pid.' 2>/dev/null');
+        $flagFile = dirname($pidFile) . '/creator_running.flag';
+        // Read the wrapper PID from the flag file (launcher writes its PID there)
+        $wrapperPid = file_exists($flagFile) ? (int)trim(file_get_contents($flagFile)) : 0;
+        if (isWindows()) {
+            // Kill both uv.exe and python processes related to the creator
+            shell_exec('taskkill /FI "IMAGENAME eq uv.exe" /F 2>NUL');
+            if ($wrapperPid > 0) shell_exec('taskkill /PID '.$wrapperPid.' /F /T 2>NUL');
+        } else {
+            if ($wrapperPid > 0) {
+                // Kill the wrapper's entire process group
+                shell_exec('kill -TERM -'.$wrapperPid.' 2>/dev/null');
+                shell_exec('kill -TERM '.$wrapperPid.' 2>/dev/null');
+            }
+        }
+        @unlink($flagFile);
         @unlink($pidFile);
         @unlink(dirname($pidFile) . '/creator.lock');
         header('Location: '.$_SERVER['PHP_SELF']); exit;
@@ -757,7 +891,7 @@ textarea{resize:vertical;min-height:80px}
             <div class="fg"><label>IMAP Email</label><input type="text" name="imap_email" value="<?= htmlspecialchars($toml['imap_email']??'') ?>"></div>
             <div class="fg"><label>IMAP Password</label><input type="password" name="imap_password" value="<?= htmlspecialchars($toml['imap_password']??'') ?>"></div>
           </div>
-          <div class="fg"><label>IMAP Domains</label><input type="text" name="imap_domains" value="<?= htmlspecialchars($toml['imap_domains']??'') ?>"></div>
+          <div class="fg"><label>IMAP Domains</label><input type="text" name="imap_domains" value="<?= htmlspecialchars(is_array($toml['imap_domains']??'') ? implode(', ', $toml['imap_domains']) : ($toml['imap_domains']??'')) ?>"></div>
         </div>
 
         <div id="gw_section" style="display:none">
