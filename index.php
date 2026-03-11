@@ -4,6 +4,21 @@ ini_set('memory_limit', '32M'); // streaming reads keep actual usage under 4MB
 $guiCfgPath  = __DIR__ . '/gui_config.json';
 $pidFilePath = __DIR__ . '/creator.pid';
 
+function sendDiscordWebhook(string $url, array $embed): void {
+    if (!$url) return;
+    $payload = json_encode(['embeds' => [$embed]]);
+    $ctx = stream_context_create(['http' => [
+        'method'  => 'POST',
+        'header'  => "Content-Type: application/json
+Content-Length: " . strlen($payload) . "
+",
+        'content' => $payload,
+        'timeout' => 5,
+        'ignore_errors' => true,
+    ]]);
+    @file_get_contents($url, false, $ctx);
+}
+
 if (isset($_GET['status_check']) || isset($_GET['log_tail'])) {
     $gcfg    = file_exists($guiCfgPath) ? (json_decode(file_get_contents($guiCfgPath), true) ?? []) : [];
     $cdir    = rtrim($gcfg['creator_dir'] ?? '', '/\\');
@@ -66,6 +81,39 @@ if (isset($_GET['status_check']) || isset($_GET['log_tail'])) {
             'total_mb' => round($totalMb, 2),
             'avg_mb'   => $avgMb,
         ]);
+        exit;
+    }
+
+    // Send Discord notification when creator finishes
+    if (isset($_GET['discord_notify'])) {
+        header('Content-Type: application/json');
+        $webhook  = trim($gcfg['discord_webhook'] ?? '');
+        $created  = (int)($_GET['created']  ?? 0);
+        $failed   = (int)($_GET['failed']   ?? 0);
+        $totalMb  = (float)($_GET['total_mb'] ?? 0);
+        $avgMb    = (float)($_GET['avg_mb']   ?? 0);
+        $total    = $created + $failed;
+        $rate     = $total > 0 ? round($created / $total * 100, 1) : 0;
+        if ($webhook) {
+            $color = $failed === 0 ? 3066993 : ($created === 0 ? 15158332 : 16776960);
+            sendDiscordWebhook($webhook, [
+                'title'       => '✅ Account Creator Finished',
+                'color'       => $color,
+                'description' => "Creation run completed.",
+                'fields'      => [
+                    ['name'=>'✔ Created',       'value'=>(string)$created,              'inline'=>true],
+                    ['name'=>'✖ Failed',         'value'=>(string)$failed,               'inline'=>true],
+                    ['name'=>'Success Rate',      'value'=>$rate.'%',                     'inline'=>true],
+                    ['name'=>'Total Data Used',   'value'=>round($totalMb,2).'MB',        'inline'=>true],
+                    ['name'=>'Avg Data / Account','value'=>$avgMb.'MB',                   'inline'=>true],
+                ],
+                'footer' => ['text' => 'Jagex Creator · '.date('Y-m-d H:i:s')],
+                'timestamp' => gmdate('Y-m-d\TH:i:s\Z'),
+            ]);
+            echo json_encode(['sent' => true]);
+        } else {
+            echo json_encode(['sent' => false, 'reason' => 'No webhook configured']);
+        }
         exit;
     }
 }
@@ -312,10 +360,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // Save GUI settings (creator dir + EF key)
     if ($action === 'save_gui') {
-        $gui['creator_dir'] = rtrim(trim($_POST['creator_dir'] ?? ''), '/\\');
-        $gui['ef_api_key']  = trim($_POST['ef_api_key'] ?? '');
-        $gui['uv_path']     = trim($_POST['uv_path'] ?? '');
-        $gui['python_path'] = trim($_POST['python_path'] ?? '');
+        $gui['creator_dir']      = rtrim(trim($_POST['creator_dir'] ?? ''), '/\\');
+        $gui['ef_api_key']       = trim($_POST['ef_api_key'] ?? '');
+        $gui['uv_path']          = trim($_POST['uv_path'] ?? '');
+        $gui['python_path']      = trim($_POST['python_path'] ?? '');
+        $gui['discord_webhook']  = trim($_POST['discord_webhook'] ?? '');
         saveGui($guiConfig, $gui);
         header('Location: '.$_SERVER['PHP_SELF'].'?saved=gui'); exit;
     }
@@ -623,6 +672,7 @@ textarea{resize:vertical;min-height:80px}
   <a class="nav-link" href="dashboard.php">Account Dashboard</a>
   <a class="nav-link" href="agents.php">Agent Monitor</a>
   <a class="nav-link" href="accounts.php">Accounts</a>
+  <a class="nav-link" href="lifespan.php">Playtime</a>
   <div class="nav-right">
     <div class="status-dot <?= $running ? 'running' : '' ?>"></div>
     <span class="status-label"><?= $running ? 'RUNNING' : 'STOPPED' ?></span>
@@ -672,8 +722,19 @@ textarea{resize:vertical;min-height:80px}
               placeholder="e.g. C:\Users\you\AppData\Local\Programs\Python\Python312\pythonw.exe">
             <div class="hint">Used to launch the creator on Windows. Find it by running: where pythonw  (or where python)</div>
           </div>
+          <div class="fg" style="border-top:1px solid var(--border);padding-top:14px;margin-top:4px">
+            <label>Discord Webhook URL <span style="color:var(--muted);font-weight:400;font-size:11px">(optional)</span></label>
+            <input type="text" name="discord_webhook"
+              value="<?= htmlspecialchars($gui['discord_webhook'] ?? '') ?>"
+              placeholder="https://discord.com/api/webhooks/…"
+              autocomplete="off">
+            <div class="hint">Receives alerts for: creator completion, agent offline/underutilization, ban wave detection. Leave blank to disable.</div>
+          </div>
           <div class="btn-row">
             <button type="submit" class="btn btn-accent">Save Settings</button>
+            <?php if (!empty($gui['discord_webhook'])): ?>
+            <button type="button" class="btn btn-subtle" onclick="testWebhook()">Test Webhook</button>
+            <?php endif; ?>
           </div>
         </form>
       </div>
@@ -1043,39 +1104,60 @@ if (lb) lb.scrollTop = lb.scrollHeight;
 // Poll log + stats every 3s
 function sv(id, val) { const el = document.getElementById(id); if (el) el.textContent = val; }
 
+let _prevRunning = null;
+let _lastStats   = {};
+let _discordNotified = false; // only fire once per run completion
+
 setInterval(() => {
   fetch('?log_tail=1')
     .then(r => r.json())
     .then(d => {
-      // Update log box
       if (lb) {
         lb.innerHTML = d.html || '<div style="color:var(--muted)">No output yet.</div>';
         lb.scrollTop = lb.scrollHeight;
       }
-      // Update log line count
       const lc = document.getElementById('logLineCount');
       if (lc) lc.textContent = (d.lines || 0) + ' lines';
-
-      // Update bandwidth stat cards
       sv('bw-created',  d.created  ?? 0);
       sv('bw-failed',   d.failed   ?? 0);
       sv('bw-total',    (d.total_mb ?? 0) + 'MB');
       sv('bw-avg',      d.created > 0 ? (d.avg_mb + 'MB') : '—');
+      _lastStats = d;
     })
     .catch(() => {});
 
-  // Status badge
+  // Status badge + Discord completion alert
   fetch('?status_check=1').then(r=>r.json()).then(d=>{
     const on = d.running;
     document.querySelectorAll('.status-dot').forEach(el => el.classList.toggle('running', on));
-    document.querySelectorAll('.status-label').forEach(el => {
-      el.innerHTML = on ? 'RUNNING' : 'STOPPED';
-    });
-    document.querySelectorAll('.proc-label').forEach(el => {
-      el.innerHTML = 'Status: ' + (on ? '<em>RUNNING</em>' : 'STOPPED');
-    });
+    document.querySelectorAll('.status-label').forEach(el => { el.innerHTML = on ? 'RUNNING' : 'STOPPED'; });
+    document.querySelectorAll('.proc-label').forEach(el => { el.innerHTML = 'Status: ' + (on ? '<em>RUNNING</em>' : 'STOPPED'); });
+
+    // Fire Discord webhook once when process transitions running→stopped
+    // and there are actual stats to report
+    if (_prevRunning === true && on === false && !_discordNotified && _lastStats.created > 0) {
+      _discordNotified = true;
+      const p = new URLSearchParams({
+        discord_notify: 1,
+        created:  _lastStats.created  || 0,
+        failed:   _lastStats.failed   || 0,
+        total_mb: _lastStats.total_mb || 0,
+        avg_mb:   _lastStats.avg_mb   || 0,
+      });
+      fetch('?' + p.toString()).catch(() => {});
+    }
+    // Reset flag when a new run starts
+    if (on && _prevRunning === false) _discordNotified = false;
+    _prevRunning = on;
   }).catch(()=>{});
 }, 3000);
+
+function testWebhook() {
+  fetch('?discord_notify=1&created=5&failed=1&total_mb=6.2&avg_mb=1.03')
+    .then(r => r.json())
+    .then(d => alert(d.sent ? '✓ Test message sent to Discord!' : 'Not sent: ' + (d.reason || 'unknown')))
+    .catch(() => alert('Request failed'));
+}
 </script>
 
 

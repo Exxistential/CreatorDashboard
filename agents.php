@@ -268,6 +268,7 @@ tr:hover td{background:rgba(0,255,136,.02)}
   <a class="nav-link" href="dashboard.php">Account Dashboard</a>
   <a class="nav-link active" href="agents.php">Agent Monitor</a>
   <a class="nav-link" href="accounts.php">Accounts</a>
+  <a class="nav-link" href="lifespan.php">Playtime</a>
   <div class="nav-right">
     <div class="clock" id="clockEl"></div>
     <span class="ref-label" id="refEl"></span>
@@ -517,16 +518,104 @@ tr:hover td{background:rgba(0,255,136,.02)}
 // Clock
 (function(){ function t(){ document.getElementById('clockEl').textContent=new Date().toLocaleTimeString('en-US',{hour12:false}); } t(); setInterval(t,1000); })();
 
-// Countdown auto-refresh
+// ── Discord helpers ──────────────────────────────────────────────────────────
+const WEBHOOK = <?= json_encode($gui['discord_webhook'] ?? '') ?>;
+
+function discordEmbed(embed) {
+  if (!WEBHOOK) return;
+  fetch(WEBHOOK, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({embeds:[embed]})
+  }).catch(()=>{});
+}
+
+// ── Agent state tracking for offline + utilization alerts ───────────────────
+// Stored in sessionStorage so it survives the page reload cycle
+function loadState() {
+  try { return JSON.parse(sessionStorage.getItem('agentState') || '{}'); } catch(e) { return {}; }
+}
+function saveState(s) {
+  try { sessionStorage.setItem('agentState', JSON.stringify(s)); } catch(e) {}
+}
+
+const AGENT_DATA = <?= json_encode(array_map(fn($a) => [
+  'name'           => $a['name'],
+  'status'         => $a['presence_status'],
+  'active_threads' => (int)($a['active_threads'] ?? 0),
+  'total_capacity' => (int)($a['total_capacity'] ?? 0),
+], $agents)) ?>;
+
+const NOW_TS   = <?= time() ?>;
+const UTIL_THROTTLE_SEC = 6 * 3600; // 6 hours between underutil alerts per agent
+
+(function checkAlerts(){
+  const state = loadState();
+  const alerts = [];
+
+  AGENT_DATA.forEach(agent => {
+    const key     = 'agent_' + agent.name.replace(/\W/g,'_');
+    const prev    = state[key] || {};
+
+    // ── Offline alert: was online last refresh, now offline ──────────────────
+    if (prev.status === 'online' && agent.status !== 'online') {
+      alerts.push({
+        title: '🔴 Agent Went Offline',
+        color: 15158332,
+        fields: [
+          {name:'Agent', value:agent.name, inline:true},
+          {name:'Previous Status', value:'online', inline:true},
+        ],
+        footer: {text:'Jagex Creator · Agent Monitor'},
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    // ── Underutilization alert: online, capacity > 0, under 75% ─────────────
+    const util = agent.total_capacity > 0
+      ? agent.active_threads / agent.total_capacity
+      : 1;
+    if (agent.status === 'online' && agent.total_capacity > 0 && util < 0.75) {
+      const lastAlert = prev.util_alerted_at || 0;
+      if ((NOW_TS - lastAlert) >= UTIL_THROTTLE_SEC) {
+        state[key] = {...(state[key]||{}), util_alerted_at: NOW_TS};
+        alerts.push({
+          title: '⚠️ Agent Underutilized',
+          color: 16776960,
+          fields: [
+            {name:'Agent',          value:agent.name,                                         inline:true},
+            {name:'Utilization',    value: Math.round(util*100)+'%',                          inline:true},
+            {name:'Threads',        value: agent.active_threads+'/'+agent.total_capacity,     inline:true},
+          ],
+          footer: {text:'Jagex Creator · Agent Monitor (max 1 alert per 6h per agent)'},
+          timestamp: new Date().toISOString(),
+        });
+      }
+    }
+
+    // Update stored status
+    state[key] = {...(state[key]||{}), status: agent.status};
+  });
+
+  saveState(state);
+  alerts.forEach(embed => discordEmbed(embed));
+})();
+
+// ── Countdown auto-refresh — stops if user navigated away ───────────────────
 (function(){
   let r = <?= $refreshSec ?>;
   const el = document.getElementById('refEl');
+  if (!el) return;
   el.textContent = 'refresh ' + r + 's';
   let iv = setInterval(function(){
+    if (document.hidden) return; // tab not visible, don't reload
     r--;
     el.textContent = 'refresh ' + r + 's';
     if (r < 0) { clearInterval(iv); location.reload(); }
   }, 1000);
+  // If user navigates away, kill the interval so it can't fire location.reload()
+  // on a page that has already unloaded (which confuses the browser history)
+  window.addEventListener('beforeunload', function(){ clearInterval(iv); });
 })();
 </script>
 </body>

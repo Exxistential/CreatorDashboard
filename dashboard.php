@@ -344,6 +344,7 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
   <a class="nav-link active" href="dashboard.php">Account Dashboard</a>
   <a class="nav-link" href="agents.php">Agent Monitor</a>
   <a class="nav-link" href="accounts.php">Accounts</a>
+  <a class="nav-link" href="lifespan.php">Playtime</a>
   <div class="nav-right">
     <div class="clock" id="clockEl"></div>
     <span class="refresh-label" id="refEl"></span>
@@ -533,16 +534,66 @@ select:focus,input:focus{border-color:rgba(0,255,136,.4)}
 // Clock
 (function(){ function t(){ document.getElementById('clockEl').textContent=new Date().toLocaleTimeString('en-US',{hour12:false}); } t(); setInterval(t,1000); })();
 
-// Countdown auto-refresh
+// ── Discord ban wave alerts ──────────────────────────────────────────────────
+const WEBHOOK   = <?= json_encode($gui['discord_webhook'] ?? '') ?>;
+const NOW_TS    = <?= time() ?>;
+const BAN_ALERTS = <?php
+  // Pass any categories that have a fresh survival_drop flag
+  $ba = [];
+  foreach ($cards as $card) {
+    if (!empty($card['survival_drop'])) {
+      $ba[] = ['name' => $card['name'], 'id' => $card['id'],
+               'active' => $card['active'], 'banned' => $card['banned'],
+               'survival_pct' => $card['survival_pct']];
+    }
+  }
+  echo json_encode($ba);
+?>;
+
+(function checkBanWaveAlerts(){
+  if (!WEBHOOK || !BAN_ALERTS.length) return;
+  // Throttle: only alert once per category per hour
+  let state;
+  try { state = JSON.parse(sessionStorage.getItem('dashBanState') || '{}'); } catch(e){ state={}; }
+
+  BAN_ALERTS.forEach(cat => {
+    const key  = 'banwave_' + cat.id;
+    const last = state[key] || 0;
+    if ((NOW_TS - last) < 3600) return; // already alerted in last hour
+    state[key] = NOW_TS;
+    fetch(WEBHOOK, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify({embeds:[{
+        title: '🚨 Possible Ban Wave Detected',
+        color: 15158332,
+        description: 'Survival rate dropped ≥5% since last refresh.',
+        fields: [
+          {name:'Category',     value:cat.name,                     inline:true},
+          {name:'Survival',     value:cat.survival_pct+'%',         inline:true},
+          {name:'Active / Banned', value:cat.active+' / '+cat.banned, inline:true},
+        ],
+        footer: {text:'Jagex Creator · Account Dashboard'},
+        timestamp: new Date().toISOString(),
+      }]})
+    }).catch(()=>{});
+  });
+  try { sessionStorage.setItem('dashBanState', JSON.stringify(state)); } catch(e){}
+})();
+
+// ── Countdown auto-refresh ───────────────────────────────────────────────────
 (function(){
   let r = <?= $refreshSec ?>;
   const el = document.getElementById('refEl');
+  if (!el) return;
+  el.textContent = 'refresh ' + r + 's';
   let iv = setInterval(function(){
-    el.textContent = 'refresh ' + r + 's';
+    if (document.hidden) return;
     r--;
+    el.textContent = 'refresh ' + r + 's';
     if (r < 0) { clearInterval(iv); location.reload(); }
   }, 1000);
-  el.textContent = 'refresh ' + r + 's';
+  window.addEventListener('beforeunload', function(){ clearInterval(iv); });
 })();
 
 // Category dropdown → hidden name
